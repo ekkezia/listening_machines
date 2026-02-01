@@ -7,7 +7,7 @@ numpy
 pyserial
 sounddevice
 soundfile
-torch
-torchaudio
-torchcodec
+# torch
+# torchaudio
+# torchcodec
 tqdm

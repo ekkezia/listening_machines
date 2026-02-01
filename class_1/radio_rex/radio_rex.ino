@@ -1,21 +1,45 @@
-const int LED_PIN = 13; // built-in LED on most Arduinos
+// const int LED_PIN = 3; // built-in LED on most Arduinos
+
+// void setup() {
+//     Serial.begin(9600);
+//     pinMode(LED_PIN, OUTPUT);
+//     digitalWrite(LED_PIN, LOW);
+// }
+
+// void loop() {
+//     // check if data received from Python
+//     if (Serial.available() > 0) {
+//         char received = Serial.read();
+
+//         if (received == '1') {
+//             digitalWrite(LED_PIN, HIGH);
+//         }
+//         else if (received == '0') {
+//             digitalWrite(LED_PIN, LOW);
+//         }
+//     }
+// }
+
+#include <Servo.h>
+
+Servo myservo;  // create Servo object to control a servo
+
+int potpin = A0;  // analog pin used to connect the potentiometer
+int val;    // variable to read the value from the analog pin
 
 void setup() {
-    Serial.begin(9600);
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
+  myservo.attach(9);  // attaches the servo on pin 9 to the Servo object
 }
 
 void loop() {
-    // check if data received from Python
     if (Serial.available() > 0) {
         char received = Serial.read();
 
         if (received == '1') {
-            digitalWrite(LED_PIN, HIGH);
+            myservo.write(received * 100);   
         }
         else if (received == '0') {
-            digitalWrite(LED_PIN, LOW);
+            myservo.write(0);
         }
     }
 }
