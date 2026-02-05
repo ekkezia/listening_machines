@@ -1,2 +1,4 @@
 *.wav
 .venv
+.DS_Store
+model_weights
