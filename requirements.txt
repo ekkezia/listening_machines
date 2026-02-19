@@ -1,13 +1,20 @@
 ipykernel
 ipywidgets
+kaggle
 librosa
 matplotlib
 nbstripout
 numpy
+openai-whisper
+opendatasets
+pandas
 pyserial
+scikit-learn
+seaborn
 sounddevice
 soundfile
 torch
 torchaudio
 # torchcodec
 tqdm
+xgboost

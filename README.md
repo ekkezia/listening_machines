@@ -29,3 +29,37 @@ Some things to install:
 - Optional: Configure notebook for output stripping: (could also use `pre-commit` down the line...)
 
     `nbstripout --install`
+
+## Troubleshooting
+
+### llvmlite / numba / librosa fails to install (e.g. "Could not find LLVM" or "Failed to build llvmlite")
+
+uv may be building llvmlite from source instead of using a pre-built wheel. Try in order:
+
+1. **Force using pre-built wheels only** (no build from source):
+
+   `uv pip install --only-binary=:all: llvmlite numba -p .venv`  
+   `uv pip install -r requirements.txt -p .venv`
+
+   If that fails with “no matching distribution”, there’s no wheel for your platform; go to step 3.
+
+2. **Clear uv’s cache and reinstall** (often fixes wheel selection):
+
+   `uv cache clean llvmlite`  
+   `uv pip install llvmlite numba -p .venv`  
+   `uv pip install -r requirements.txt -p .venv`
+
+3. **If it still builds from source and fails on macOS**, install LLVM and point the build at it. **`LLVM_DIR` must be set in the same shell where you run `uv pip install`** (or use the one-line form below).
+
+   Install LLVM:
+
+   `brew install llvm`
+
+   Check that the path exists (should list `LLVMConfig.cmake`):
+
+   `ls $(brew --prefix llvm)/lib/cmake/llvm`
+
+   Then install with LLVM visible to the build (one line so the env var is set for that command):
+
+   `LLVM_DIR=$(brew --prefix llvm)/lib/cmake/llvm uv pip install llvmlite numba -p .venv`  
+   `uv pip install -r requirements.txt -p .venv`
