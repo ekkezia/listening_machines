@@ -23,6 +23,10 @@ let bgColor = { r: 20, g: 20, b: 26 };
 let targetColor = { r: 20, g: 20, b: 26 };
 let flash = 0;
 
+const GRAPH_MAX_RAW_POINTS = 5000;
+const GRAPH_MAX_VISIBLE_POINTS = 220;
+let numberHistory = [];
+
 function setup() {
   createCanvas(windowWidth, windowHeight);
   textFont("monospace");
@@ -37,6 +41,7 @@ function draw() {
   background(bgColor.r, bgColor.g, bgColor.b);
 
   drawNumberDots();
+  drawNumberGraph();
   drawHud();
   drawFlash();
 }
@@ -71,10 +76,84 @@ function drawHud() {
   text(transcript, width * 0.5, height * 0.22);
 
   textSize(min(width, height) * 0.12);
-  text(currentNumber, width * 0.5, height * 0.53);
+  text(currentNumber, width * 0.5, height * 0.46);
 
   textSize(min(width, height) * 0.03);
   text("Listen for /speech/text, /speech/color, /speech/number", width * 0.5, height * 0.92);
+}
+
+function drawNumberGraph() {
+  const panelW = width * 0.78;
+  const panelH = height * 0.2;
+  const panelX = (width - panelW) * 0.5;
+  const panelY = height * 0.63;
+  const pad = 14;
+  const graphX = panelX + pad;
+  const graphY = panelY + pad;
+  const graphW = panelW - pad * 2;
+  const graphH = panelH - pad * 2;
+
+  noStroke();
+  fill(8, 8, 10, 150);
+  rect(panelX, panelY, panelW, panelH, 10);
+
+  // Grid
+  stroke(255, 40);
+  strokeWeight(1);
+  for (let i = 0; i <= 5; i++) {
+    const y = graphY + (graphH * i) / 5;
+    line(graphX, y, graphX + graphW, y);
+  }
+
+  const { points, stride } = downsampleHistory(numberHistory, GRAPH_MAX_VISIBLE_POINTS);
+  if (points.length > 0) {
+    noFill();
+    stroke(255, 230);
+    strokeWeight(2);
+    beginShape();
+    for (let i = 0; i < points.length; i++) {
+      const x = graphX + (i * graphW) / max(1, points.length - 1);
+      const y = map(points[i], 0, 10, graphY + graphH, graphY);
+      vertex(x, y);
+    }
+    endShape();
+
+    noStroke();
+    fill(255, 230);
+    const last = points[points.length - 1];
+    const lx = graphX + graphW;
+    const ly = map(last, 0, 10, graphY + graphH, graphY);
+    circle(lx, ly, 6);
+  }
+
+  noStroke();
+  fill(255, 180);
+  textAlign(LEFT, TOP);
+  textSize(min(width, height) * 0.018);
+  text(
+    `Number History  raw:${numberHistory.length}  shown:${points.length}  stride:${stride}  max-shown:${GRAPH_MAX_VISIBLE_POINTS}`,
+    graphX,
+    graphY + graphH + 4
+  );
+  textAlign(CENTER, CENTER);
+}
+
+function downsampleHistory(values, maxVisible) {
+  const n = values.length;
+  if (n === 0) return { points: [], stride: 1 };
+
+  const stride = max(1, ceil(n / maxVisible));
+  const points = [];
+  for (let i = 0; i < n; i += stride) {
+    points.push(values[i]);
+  }
+
+  // Ensure we always include the newest value
+  if (points[points.length - 1] !== values[n - 1]) {
+    points.push(values[n - 1]);
+  }
+
+  return { points, stride };
 }
 
 function drawFlash() {
@@ -139,7 +218,15 @@ function handleOsc(address, rawArgs) {
 
   if (address === "/speech/number") {
     currentNumber = Number(args[0]) || 0;
+    addHistoryPoint(currentNumber);
     flash = 1.0;
+  }
+}
+
+function addHistoryPoint(value) {
+  numberHistory.push(constrain(Number(value) || 0, 0, 10));
+  if (numberHistory.length > GRAPH_MAX_RAW_POINTS) {
+    numberHistory.splice(0, numberHistory.length - GRAPH_MAX_RAW_POINTS);
   }
 }
 
