@@ -15,6 +15,7 @@ sounddevice
 soundfile
 torch
 torchaudio
-# torchcodec
+torchcodec
 tqdm
 xgboost
+pyautogui
