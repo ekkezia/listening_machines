@@ -1,3 +1,4 @@
+datasets
 ipykernel
 ipywidgets
 kaggle
@@ -16,6 +17,8 @@ soundfile
 torch
 torchaudio
 torchcodec
+torchvision
+transformers
 tqdm
 xgboost
 pyautogui
