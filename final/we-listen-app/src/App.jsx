@@ -232,7 +232,7 @@ export default function App() {
       const formData = new FormData();
       formData.append('audio', audioBlob, 'audio.webm');
       try {
-        const resp = await fetch('https://inviolate-subgranular-arie.ngrok-free.dev/transcribe', {
+        const resp = await fetch('https://listening-machines.onrender.com/transcribe', {
           method: 'POST',
           body: formData,
         });
