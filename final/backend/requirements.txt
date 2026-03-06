@@ -1,6 +1,4 @@
 whisper
 flask
 requests
-tempfile
-os
 flask_cors
