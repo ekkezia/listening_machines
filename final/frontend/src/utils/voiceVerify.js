@@ -3,16 +3,11 @@
  *
  * Two-layer voice verification:
  *   transcribeAndMatch(phrase, timeoutMs?) — Web Speech API implementation.
- *   verifyVoiceCommand(phrase) — designated entry point; swap body for your API.
+ *   checkVoiceCommand(phrase) — designated entry point; check voice commands that are not dependent to user voice (no need to fetch model)
+ *   swap body for your API.
  */
 
-const SUPPORTED_PHRASES = [
-  'i agree',
-  'record me',
-  'record for us',
-  'listen to me',
-  'listen to us',
-];
+export const COMMANDS = ['record me', 'record for us', 'listen to me', 'listen to us', 'i agree', 'stop recording', 'stop listening', 'connect us'];
 
 /**
  * Opens a single-use Web Speech API session and returns true if the user
@@ -27,7 +22,7 @@ export function transcribeAndMatch(phrase, timeoutMs = 7000) {
     }
 
     const normalized = phrase.trim().toLowerCase();
-    if (!SUPPORTED_PHRASES.includes(normalized)) {
+    if (!COMMANDS.includes(normalized)) {
       console.warn(`[voiceVerify] "${phrase}" is not in the supported phrases list.`);
     }
 
@@ -85,6 +80,6 @@ export function transcribeAndMatch(phrase, timeoutMs = 7000) {
  * Designated verification entry point.
  * Swap the body of this function with your own API call when ready.
  */
-export async function verifyVoiceCommand(phrase) {
+export async function checkVoiceCommand(phrase) {
   return transcribeAndMatch(phrase);
 }

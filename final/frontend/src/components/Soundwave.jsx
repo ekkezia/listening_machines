@@ -101,7 +101,9 @@ export default function Soundwave({ isActive }) {
         cancelled = true;
         cancelAnimationFrame(rafRef.current);
         stream?.getTracks().forEach(t => t.stop());
-        ctx?.close();
+        if (ctx?.state && ctx.state !== 'closed') {
+          ctx.close().catch(() => {});
+        }
       };
     }
 

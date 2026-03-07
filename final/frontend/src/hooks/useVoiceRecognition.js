@@ -1,6 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react';
-
-const COMMANDS = ['record me', 'record for us', 'listen to me', 'listen to us', 'i agree'];
+import { COMMANDS } from '../utils/voiceVerify';
 
 const dispatch = (cmd) =>
   window.dispatchEvent(new CustomEvent('voiceCommand', { detail: cmd }));
@@ -49,7 +48,9 @@ export default function useVoiceRecognition({ enabled, onSpeechStart, onSpeechEn
     };
 
     rec.onerror = (e) => {
-      if (e.error !== 'no-speech') console.warn('[Darwin] SR error:', e.error);
+      if (e.error !== 'no-speech' && e.error !== 'aborted') {
+        console.warn('[Darwin] SR error:', e.error);
+      }
       onSpeechEnd?.();
     };
 

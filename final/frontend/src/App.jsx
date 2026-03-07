@@ -10,7 +10,8 @@ import DebugPanel from './components/DebugPanel';
 import UnlockConsentOverlay from './components/UnlockConsentOverlay';
 import useVoiceRecognition from './hooks/useVoiceRecognition';
 import useAudioRecorder from './hooks/useAudioRecorder';
-import { verifyVoiceCommand } from './utils/voiceVerify';
+import { checkVoiceCommand } from './utils/voiceVerify';
+import { BACKEND_URL } from './config';
 
 const UNLOCK_COUNTDOWN_SECONDS = 3;
 const UNLOCK_REQUEST_TTL_MS = 5 * 60 * 1000;
@@ -161,7 +162,7 @@ export default function App() {
   const onSpeechEnd = useCallback(() => setIsHearing(false), []);
 
   useVoiceRecognition({
-    enabled: isLoggedIn && !verifying && recordingState !== 'recording' && !isUnlocked,
+    enabled: isLoggedIn && !verifying && !isUnlocked,
     onSpeechStart,
     onSpeechEnd,
   });
@@ -232,7 +233,7 @@ export default function App() {
       const formData = new FormData();
       formData.append('audio', audioBlob, 'audio.webm');
       try {
-        const resp = await fetch('https://listening-machines.onrender.com/transcribe', {
+        const resp = await fetch(`${BACKEND_URL}/transcribe`, {
           method: 'POST',
           body: formData,
         });
@@ -252,16 +253,34 @@ export default function App() {
     });
   }, [stopAndUpload]);
 
-  const startPrivateUnlockFlow = useCallback(() => {
-    if (activeUnlockRequestRef.current && !isUnlockRequestComplete(activeUnlockRequestRef.current)) {
-      setVerifyError('Finish the current unlock prompt first.');
-      return;
-    }
+  const startPrivateUnlockFlow = useCallback(async () => {
+  if (activeUnlockRequestRef.current && !isUnlockRequestComplete(activeUnlockRequestRef.current)) {
+    setVerifyError('Finish the current unlock prompt first.');
+    return;
+  }
 
-    setVerifyError('');
-    setActiveTab('me');
-    setActiveUnlockRequest(buildPrivateUnlockRequest({ userId, userName }));
-  }, [userId, userName]);
+  setVerifyError('');
+  setActiveTab('me');
+
+  const request = buildPrivateUnlockRequest({ userId, userName });
+  setActiveUnlockRequest(request);
+
+  try {
+    // Start recording immediately for verification
+    pendingRecordRef.current = {
+      sender: userId,
+      recipient: userId,
+      type: 'private'
+    };
+
+    await startRecording();
+    setRecordingState('recording');
+
+  } catch (err) {
+    console.error('[Unlock] Failed to start recording:', err);
+    setVerifyError('Microphone could not start.');
+  }
+}, [userId, userName, startRecording]);
 
   const startSharedUnlockFlow = useCallback(async () => {
     if (unlockActionPendingRef.current) return;
@@ -336,18 +355,54 @@ export default function App() {
     if (countdownRemaining > 0) return;
 
     if (request.kind === 'private') {
-      const now = new Date().toISOString();
-      setActiveUnlockRequest((current) => {
-        if (!current || current.id !== request.id) return current;
-        return {
-          ...current,
-          requesterAgreedAt: now,
-          status: 'unlocked',
-          unlockedAt: now,
-        };
-      });
+  const now = new Date().toISOString();
+
+  try {
+    const result = await stopAndUpload('private', { upload: false, transcribe: false });
+
+    if (!result || !result.blob) {
+      setVerifyError('Recording failed. Please try again.');
+      console.error('[Unlock] stopAndUpload returned null', result);
       return;
     }
+
+    const audioBlob = result.blob;
+
+    const formData = new FormData();
+    formData.append('audio', audioBlob, 'audio.webm');
+    console.log('user id', userId)
+    formData.append('user_id', userId);
+
+    const resp = await fetch(`${BACKEND_URL}/verify-me`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    const data = await resp.json();
+    console.log('[verify-me result]', data);
+
+    if (data.error) {
+      setVerifyError(data.error);
+      return;
+    }
+
+    setActiveUnlockRequest((current) => {
+      if (!current || current.id !== request.id) return current;
+      return {
+        ...current,
+        requesterAgreedAt: now,
+        status: 'unlocked',
+        unlockedAt: now,
+      };
+    });
+
+  } catch (err) {
+    console.error('[Unlock verify error]', err);
+    setVerifyError('Verification failed.');
+  }
+
+  return;
+}
 
     const isRequester = request.requesterId === userId;
     const alreadyAgreed = isRequester ? request.requesterAgreedAt : request.partnerAgreedAt;
@@ -360,6 +415,8 @@ export default function App() {
       const now = new Date().toISOString();
       const payload = isRequester ? { requester_agreed_at: now } : { partner_agreed_at: now };
       const otherAgreedAt = isRequester ? request.partnerAgreedAt : request.requesterAgreedAt;
+      
+      // verify the voice id of me
 
       if (otherAgreedAt) {
         payload.status = 'unlocked';
@@ -599,6 +656,7 @@ export default function App() {
         return;
       }
 
+      // TODO: abstract this somewhere else
       if (cmd === 'record me') {
         beginRecording('private');
       } else if (cmd === 'record for us') {
@@ -607,13 +665,19 @@ export default function App() {
         startPrivateUnlockFlow();
       } else if (cmd === 'listen to us') {
         await startSharedUnlockFlow();
+      } else if (cmd === 'stop recording') {
+        handleStopRecording();
+      } else if (cmd === 'connect us') {
+        // Handle connect us command
+      } else if (cmd === 'stop listening') {
+        // Handle stop listening command
       } else if (cmd === 'i agree') {
         const invites = pendingInvitationsRef.current;
         if (invites.length === 0) return;
 
         setVerifying(true);
         try {
-          const confirmed = await verifyVoiceCommand('I agree');
+          const confirmed = await checkVoiceCommand('I agree'); // TODO: change to verifyVoiceCommand
           if (confirmed) acceptInvitation(invites[0]);
         } finally {
           setVerifying(false);
@@ -781,6 +845,7 @@ export default function App() {
           countdownRemaining={unlockCountdownRemaining}
           isSubmitting={unlockActionPending}
           onAcceptSharedRequest={acceptSharedUnlockRequest}
+          onVerifyMe={recordUnlockAgreement}
         />
       )}
     </div>

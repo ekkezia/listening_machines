@@ -45,10 +45,12 @@ export default function VoiceMessageCard({ message, isUnlocked }) {
     }
   }, [isPlaying]);
 
-  // Stop playing when audio ends
+  // Stop playing and reset icon when audio ends
   useEffect(() => {
     if (!audioRef.current) return;
-    const handleEnded = () => setIsPlaying(false);
+    const handleEnded = () => {
+      setIsPlaying(false);
+    };
     audioRef.current.addEventListener('ended', handleEnded);
     return () => audioRef.current.removeEventListener('ended', handleEnded);
   }, []);

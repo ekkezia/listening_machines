@@ -1,6 +1,7 @@
 import { useRef, useCallback } from 'react';
 import { useMic } from '../context/MicContext';
 import { supabase } from '../supabase';
+import { BACKEND_URL } from '../config';
 
 /**
  * Records audio from the shared mic stream and uploads it to Supabase Storage.
@@ -36,7 +37,9 @@ export default function useAudioRecorder() {
     console.log('[Recorder] Started', mimeType);
   }, [ready, streamRef]);
 
-  const stopAndUpload = useCallback((pathPrefix = 'recordings') => {
+  const stopAndUpload = useCallback((pathPrefix = 'recordings', options = {}) => {
+    const upload = options.upload !== false;
+    const transcribe = options.transcribe !== false;
     return new Promise((resolve) => {
       const recorder = recorderRef.current;
       if (!recorder || recorder.state === 'inactive') {
@@ -52,21 +55,41 @@ export default function useAudioRecorder() {
           const blob = new Blob(chunksRef.current, { type: mimeType });
           chunksRef.current = [];
 
-          // Upload to Supabase Storage
-          const ext  = mimeType.includes('ogg') ? 'ogg' : 'webm';
-          const path = `${pathPrefix}/${Date.now()}.${ext}`;
-          const { error: upErr } = await supabase.storage
-            .from('recordings')
-            .upload(path, blob, { contentType: mimeType });
+          const ext = mimeType.includes("ogg") ? "ogg" : 'webm';
 
-          let url = null;
-          if (upErr) {
-            console.warn('[Recorder] Upload failed:', upErr.message);
-          } else {
-            url = supabase.storage.from('recordings').getPublicUrl(path).data.publicUrl;
-            console.log('[Recorder] Uploaded:', url);
+          if (transcribe) {
+            try {
+              const formData = new FormData();
+              formData.append("audio", blob, `audio.${ext}`);
+              const response = await fetch(`${BACKEND_URL}/transcribe`, {
+                method: "POST",
+                body: formData,
+              });
+              if (response.ok) {
+                const data = await response.json();
+                console.log("[Recorder] Whisper Transcription:", data.transcription || "");
+              } else {
+                console.warn("[Recorder] Whisper Transcription failed:", response.statusText);
+              }
+            } catch (err) {
+              console.error("[Recorder] Error during transcription:", err);
+            }
           }
 
+          let url = null;
+          if (upload) {
+            // Upload to Supabase Storage
+            const path = `${pathPrefix}/${Date.now()}.${ext}`;
+            const { error: upErr } = await supabase.storage
+              .from('recordings')
+              .upload(path, blob, { contentType: mimeType });
+            if (upErr) {
+              console.warn('[Recorder] Upload failed:', upErr.message);
+            } else {
+              url = supabase.storage.from('recordings').getPublicUrl(path).data.publicUrl;
+              console.log('[Recorder] Uploaded:', url);
+            }
+          }
           resolve({ url, duration: Math.round(duration), mimeType, blob });
         } catch (err) {
           console.error('[Recorder] Error stopping recorder:', err);

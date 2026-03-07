@@ -72,6 +72,10 @@ export default function UnlockConsentOverlay({
     eyebrow = 'Shared Consent';
     title = 'Say "I agree" now';
     body = 'Both partners should recite "I agree" now to unlock the shared data.';
+  } else {
+    eyebrow = 'Consent';
+    title = 'Say "I agree" now';
+    body = 'Speak clearly. We are verifying that the voice saying "I agree" is yours.';
   }
 
   return (
