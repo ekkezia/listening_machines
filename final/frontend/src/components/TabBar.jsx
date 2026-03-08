@@ -1,4 +1,4 @@
-export default function TabBar({ activeTab, setActiveTab, partnerName, userName }) {
+export default function TabBar({ activeTab, setActiveTab, partnerId, userId }) {
   return (
     <div className="flex border-b border-[#21273a] bg-[#0d1117]">
       {['us', 'me'].map(tab => (
@@ -14,12 +14,12 @@ export default function TabBar({ activeTab, setActiveTab, partnerName, userName 
           {tab === 'us'
             ? <div className="cursor-pointer">
                 <span className="text-[11px] text-[#4b5368] block font-normal">
-                  {partnerName ? `with ${partnerName}` : 'no partner yet'}
+                  {partnerId ? `with ${partnerId}` : 'no partner yet'}
                 </span>
-                {partnerName ? 'Us' : 'Us?'}
+                {partnerId ? 'Us' : 'Us?'}
               </div>
             : <div className="cursor-pointer">
-                <span className="text-[11px] text-[#4b5368] block font-normal">{userName}</span>
+                <span className="text-[11px] text-[#4b5368] block font-normal">{userId}</span>
                 Me
               </div>
           }

@@ -5,6 +5,8 @@ export default function PairingScreen({ userId, userName, onSendInvite }) {
   const [sending, setSending]     = useState(false);
   const [sent, setSent]           = useState(false);
   const [error, setError]         = useState('');
+  const [inviteId, setInviteId] = useState('');
+  const [inviteStatus, setInviteStatus] = useState('');
 
   const handleSend = async () => {
     const trimmed = partnerId.trim();
@@ -16,6 +18,8 @@ export default function PairingScreen({ userId, userName, onSendInvite }) {
     setError('');
     try {
       await onSendInvite(trimmed);
+      setInviteStatus('pending');
+      setInviteId(trimmed);
       setSent(true);
     } catch (err) {
       setError(err.message || 'Could not send invitation.');
@@ -37,6 +41,11 @@ export default function PairingScreen({ userId, userName, onSendInvite }) {
         <p className="text-[11px] text-[#4b5368]">
           Ask them to open We Listen and say <span className="italic text-[#8892a4]">"I agree"</span>
         </p>
+        {inviteStatus === 'pending' && (
+          <p className="text-[11px] text-[#7c3aed]">
+            Invitation to <span className="font-mono">{inviteId}</span> is pending.
+          </p>
+        )}
       </div>
     );
   }

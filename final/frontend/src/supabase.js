@@ -8,9 +8,7 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
 // ── SQL schema to run once in Supabase SQL Editor ───────────────────────────
 //
 // create table if not exists users (
-//   id         text primary key,
-//   name       text not null,
-//   voice_url  text,
+//   id         text primary key, // user_id
 //   paired_with text,
 //   created_at  timestamptz default now()
 // );
@@ -30,7 +28,6 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
 // create table if not exists invitations (
 //   id         uuid primary key default gen_random_uuid(),
 //   "from"     text not null,
-//   from_name  text not null,
 //   "to"       text not null,
 //   status     text not null default 'pending',   -- 'pending' | 'accepted'
 //   created_at timestamptz default now()
@@ -39,7 +36,6 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
 // create table if not exists unlock_requests (
 //   id                   uuid primary key default gen_random_uuid(),
 //   requester_id         text not null,
-//   requester_name       text not null,
 //   partner_id           text not null,
 //   status               text not null default 'pending_partner',  -- 'pending_partner' | 'countdown' | 'unlocked'
 //   countdown_started_at timestamptz,

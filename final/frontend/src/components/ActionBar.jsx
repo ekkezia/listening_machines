@@ -102,6 +102,10 @@ export default function ActionBar({
       )}
 
       <Soundwave isActive={!unlocking && !isUnlocked} />
+
+      {!isUnlocked && <div className="text-xs text-[#7c3aed] text-center py-2">Voice commands are active.</div>}
+      {isUnlocked && <div className="text-xs text-[#4b5368] text-center py-2">Voice commands are disabled while unlocked.</div>}
+
     </div>
   );
 }

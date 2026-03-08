@@ -2,3 +2,4 @@ openai-whisper
 flask
 requests
 flask_cors
+python-dotenv

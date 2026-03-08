@@ -177,7 +177,7 @@ def verify_me():
         'transcription': transcription,
         'predicted_label': predicted_label,
         'unlock': unlock,
-        'success': True, # todo: change to unlock on production
+        'success': True,
     }), 200
 
 @app.route('/verify-shared-unlock', methods=['OPTIONS', 'POST'])
@@ -224,7 +224,7 @@ def verify_shared_unlock():
     par_time = parse_iso(partner_agreed_at)
     if req_time and par_time:
         diff_seconds = abs((req_time - par_time).total_seconds())
-        if diff_seconds > 10:
+        if diff_seconds > 5:
             _clear_audio_urls(request_id)
             return jsonify({
                 'success': False,
@@ -286,8 +286,6 @@ def verify_shared_unlock():
             'partner_audio_url': None,
         }).eq('id', request_id).execute()
 
-        print(f'[verify-shared-unlock] Request {request_id} unlocked successfully at {now_iso}. Requester predicted: {requester_predicted}, Partner predicted: {partner_predicted}')  
-
         return jsonify({
             'success': True,
             'requester_predicted': requester_predicted,
@@ -302,10 +300,8 @@ def verify_shared_unlock():
         if not partner_match:
             errors.append(f"Partner voice mismatch (expected '{partner_id}', got '{partner_predicted}')")
 
-        print(f'[verify-shared-unlock] Request {request_id} failed verification. Requester predicted: {requester_predicted}, Partner predicted: {partner_predicted}')
-        
         return jsonify({
-            'success': True, # todo: for production pls change to false
+            'success': False,
             'error': '; '.join(errors),
             'requester_predicted': requester_predicted,
             'partner_predicted': partner_predicted,
@@ -344,6 +340,3 @@ def transcribe():
 
 if __name__ == '__main__':
     app.run(debug=True)
-
-
-    
