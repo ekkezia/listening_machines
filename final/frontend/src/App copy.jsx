@@ -12,10 +12,18 @@ import useAudioRecorder from './hooks/useAudioRecorder';
 import { checkVoiceCommand } from './utils/voiceVerify';
 import { BACKEND_URL } from './config';
 import LoginScreen from './components/LoginScreen';
-import { UNLOCK_STATUS } from './UnlockStatus';
 
 const UNLOCK_COUNTDOWN_SECONDS = 2;
 const UNLOCK_REQUEST_TTL_MS = 3 * 60 * 1000;
+
+export const UNLOCK_STATUS = {
+  RECORDING:       'recording',
+  UPLOADING:       'uploading',
+  VERIFYING:       'verifying',
+  WAITING_PARTNER: 'waiting_partner',
+  DECLINED:        'declined',
+  ERROR:           'error',
+};
 
 const mapMessage = (row) => ({
   id: row.id,
@@ -49,8 +57,8 @@ const mapUnlockRequest = (row) => ({
   partnerAgreedAt: row.partner_agreed_at,
   requesterRecordingStartedAt: row.requester_recording_started_at ?? null,
   partnerRecordingStartedAt: row.partner_recording_started_at ?? null,
-  requesterVerified: row.requester_verified ?? false,
-  partnerVerified: row.partner_verified ?? false,
+  requesterAudioUrl: row.requester_audio_url ?? null,
+  partnerAudioUrl: row.partner_audio_url ?? null,
   createdAt: row.created_at,
   unlockedAt: row.unlocked_at,
 });
@@ -80,6 +88,8 @@ const getCountdownRemaining = (startedAt, now = Date.now()) => {
 
 const isUnlockRequestComplete = (request) => {
   if (!request) return false;
+  // Only trust status===unlocked set by server after verification.
+  // agreedAt fields are written before verification completes and must not trigger unlock.
   return request.status === 'unlocked';
 };
 
@@ -92,15 +102,21 @@ const isUnlockRequestRelevant = (request, now = Date.now()) => {
   if (!request || !isUnlockRequestCurrent(request, now)) return false;
   if (isUnlockRequestComplete(request)) return true;
   if (request.status === 'declined') return true;
-  if (request.status === 'verification_failed') return false;
-  return ['pending_partner', 'countdown', 'recording', 'waiting_partner', 'verifying'].includes(request.status);
+  if (request.status === 'verification_failed') return false; // terminal — don't re-show
+  return request.status === 'pending_partner' || request.status === 'countdown'
+    || request.status === 'recording' || request.status === 'waiting_partner'
+    || request.status === 'verifying';
 };
 
 const isUnlockRequestActive = (request, now = Date.now()) => {
   if (!request || !isUnlockRequestCurrent(request, now) || isUnlockRequestComplete(request)) return false;
-  return ['pending_partner', 'countdown', 'recording', 'waiting_partner', 'verifying'].includes(request.status);
+  return request.status === 'pending_partner' || request.status === 'countdown'
+    || request.status === 'recording' || request.status === 'waiting_partner'
+    || request.status === 'verifying';
 };
 
+// Writes or clears active_unlock_request_id on the users row.
+// Pass null to clear it (request resolved/declined/errored).
 const setUserActiveUnlock = async (userId, requestId) => {
   await supabase.from('users')
     .update({ active_unlock_request_id: requestId })
@@ -129,16 +145,23 @@ const saveMessage = async (data) => {
 };
 
 /**
- * Opens a mic stream and records until the always-on SpeechRecognition hook
- * fires a 'voiceCommand' event containing "i agree", then stops.
- * Returns { blob, detected }. Timeout at timeoutMs (default 15s).
+ * Records audio until the always-on SpeechRecognition (useVoiceRecognition) fires
+ * a voiceCommand event containing "i agree", then returns { blob, detected }.
+ *
+ * Does NOT pause the main recogniser — it stays running so it can detect "i agree".
+ * Opens a separate getUserMedia stream purely for MediaRecorder (audio capture).
+ * On desktop Chrome two concurrent mic consumers work fine; on mobile we fall back
+ * gracefully if getUserMedia fails while Speech API holds the mic.
+ *
+ * Timeout fallback at timeoutMs (default 15s).
  */
 const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, reject) => {
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (err) {
-    // Some mobile browsers grant Speech API exclusive mic access — pause it and retry.
+    // On some mobile browsers the Speech API holds exclusive mic access.
+    // Pause it, wait, then retry once.
     console.warn('[recordUntilIAgree] First getUserMedia failed, pausing Speech API and retrying:', err.message);
     window._darwinPause?.();
     await new Promise(r => setTimeout(r, 400));
@@ -163,7 +186,7 @@ const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, rej
   };
 
   recorder.start();
-  console.log('[recordUntilIAgree] Recording started — waiting for "i agree"...');
+  console.log('[recordUntilIAgree] Recording started. Waiting for "i agree"...');
 
   let detected = false;
   let stopped = false;
@@ -193,7 +216,7 @@ const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, rej
 
   await new Promise(r => { recorder.onstop = r; });
   stream.getTracks().forEach(t => t.stop());
-  window._darwinResume?.();
+  window._darwinResume?.(); // resume if we had to pause for the retry
   const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
   console.log('[recordUntilIAgree] Done. detected:', detected, 'blob:', blob.size, 'bytes');
   resolve({ blob, detected });
@@ -240,7 +263,7 @@ export default function App() {
     setSessionChecked(true);
   }, []);
 
-  useEffect(() => { partnerIdRef.current = partnerId; }, [partnerId]);
+    useEffect(() => { partnerIdRef.current = partnerId; }, [partnerId]);
   useEffect(() => { userIdRef.current = userId; }, [userId]);
   useEffect(() => { pendingInvitationsRef.current = pendingInvitations; }, [pendingInvitations]);
   useEffect(() => { activeUnlockRequestRef.current = activeUnlockRequest; }, [activeUnlockRequest]);
@@ -315,7 +338,7 @@ export default function App() {
     const meta = pendingRecordRef.current;
     if (!meta) return;
     pendingRecordRef.current = null;
-    setRecordingState('uploading');
+    setRecordingState('uploading'); // keep button disabled during upload + transcribe
 
     const result = await stopAndUpload(meta.type, { upload: true, transcribe: false });
 
@@ -343,8 +366,10 @@ export default function App() {
       transcription,
     });
 
-    if (!inserted) { setRecordingState('idle'); return; }
-
+    if (!inserted) {
+      setRecordingState('idle');
+      return;
+    }
     const mapped = mapMessage(inserted);
     if (meta.type === 'private') {
       setPrivateMessages((prev) => prev.some((m) => m.id === mapped.id) ? prev : [mapped, ...prev]);
@@ -364,6 +389,7 @@ export default function App() {
     setActiveTab('me');
     setUnlockActionPending(true);
 
+    // Insert a real DB row so the attempt is logged and the overlay has a proper id
     const now = new Date().toISOString();
     let request;
     try {
@@ -371,7 +397,7 @@ export default function App() {
         .from('unlock_requests')
         .insert({
           requester_id: userId,
-          partner_id: userId,
+          partner_id: userId, // self-unlock
           type: 'private',
           status: 'countdown',
           countdown_started_at: now,
@@ -394,6 +420,7 @@ export default function App() {
       };
     } catch (err) {
       console.error('[Unlock:private] Failed to insert unlock_request row:', err);
+      // Fall back to a local-only request so the UI still works
       request = buildPrivateUnlockRequest({ userId });
     }
 
@@ -401,7 +428,10 @@ export default function App() {
     await setUserActiveUnlock(userId, request.id);
 
     try {
-      await new Promise(r => setTimeout(r, UNLOCK_COUNTDOWN_SECONDS * 1000));
+      // Wait out the countdown visually, then auto-record
+      const countdownMs = UNLOCK_COUNTDOWN_SECONDS * 1000;
+      await new Promise(r => setTimeout(r, countdownMs));
+
       console.log('[Unlock:private] Countdown done — starting recording');
       setUnlockStatus(UNLOCK_STATUS.RECORDING);
 
@@ -447,9 +477,10 @@ export default function App() {
       }
 
       console.log('[Unlock:private] /verify-me response:', data);
-      if (!data.success) {
+      if (data.error || !data.success) {
         setVerifyError(data.error || 'Voice verification failed.');
         setUnlockStatus(UNLOCK_STATUS.ERROR);
+        // Log the failure in DB
         await supabase.from('unlock_requests')
           .update({ status: 'verification_failed' })
           .eq('id', request.id);
@@ -472,7 +503,7 @@ export default function App() {
     } finally {
       setUnlockActionPending(false);
     }
-  }, [userId, markUnlocked]);
+  }, [userId]);
 
   const startSharedUnlockFlow = useCallback(async () => {
     if (unlockActionPendingRef.current) return;
@@ -494,6 +525,7 @@ export default function App() {
         created_at: new Date().toISOString(),
       }).select().single();
       if (error) throw error;
+      // Mark both users as having an active unlock request so login restore works correctly
       await Promise.all([
         setUserActiveUnlock(userId, data.id),
         setUserActiveUnlock(currentPartnerId, data.id),
@@ -530,9 +562,12 @@ export default function App() {
     }
   }, []);
 
+  // ── Decline: marks DB status=declined, then dismisses locally after a beat
   const declineUnlockRequest = useCallback(async () => {
     const request = activeUnlockRequestRef.current;
     if (!request) { dismissUnlockOverlay(); return; }
+
+    // Private unlocks are local-only — just dismiss
     if (request.kind === 'private') { dismissUnlockOverlay(); return; }
 
     console.log('[Unlock] Declining request:', request.id);
@@ -541,52 +576,47 @@ export default function App() {
       await supabase.from('unlock_requests')
         .update({ status: 'declined' })
         .eq('id', request.id);
+      // Clear the active pointer on both users so login restore won't resurface this
       await Promise.all([
         setUserActiveUnlock(request.requesterId, null),
         setUserActiveUnlock(request.partnerId, null),
       ]);
+      // Show declined state — user must close manually
       setActiveUnlockRequest((cur) => cur?.id === request.id ? { ...cur, status: 'declined' } : cur);
       setUnlockStatus(UNLOCK_STATUS.DECLINED);
     } catch (err) {
       console.error('[Unlock] Decline failed:', err);
+      // Still show declined state rather than silently closing
       setUnlockStatus(UNLOCK_STATUS.DECLINED);
     } finally {
       setUnlockActionPending(false);
     }
   }, [dismissUnlockOverlay]);
 
-  /**
-   * Shared unlock agreement flow — called automatically when countdown hits 0.
-   *
-   * Step 1: Record "I agree" via mic.
-   * Step 2: Send audio to /verify-me — verifies "I agree" was said AND voice matches.
-   * Step 3: On success, write requester_verified=true (or partner_verified=true)
-   *         + agreed_at timestamp to the unlock_request row.
-   * Step 4: If both are now verified, call /verify-shared-unlock for timing check.
-   *         Server writes status='unlocked' on success.
-   *
-   * No audio is ever uploaded to storage — it only exists in memory during /verify-me.
-   */
   const recordUnlockAgreement = useCallback(async () => {
     const request = activeUnlockRequestRef.current;
     if (!request || unlockActionPendingRef.current || isUnlockRequestComplete(request)) return;
-    if (request.status === 'pending_partner' || request.status === 'declined') return;
+    if (request.status === 'pending_partner') return;
+    if (request.status === 'declined') return;
 
     const countdownRemaining = request.status === 'countdown'
       ? getCountdownRemaining(request.countdownStartedAt, Date.now())
       : 0;
     if (countdownRemaining > 0) return;
-    if (request.kind === 'private') return;
-
-    const isRequester = request.requesterId === userId;
-    const alreadyVerified = isRequester ? request.requesterVerified : request.partnerVerified;
-    if (alreadyVerified) return;
 
     setVerifyError('');
     setUnlockStatus(null);
     setUnlockActionPending(true);
 
     try {
+      // Private unlock is fully handled in startPrivateUnlockFlow
+      if (request.kind === 'private') { setUnlockActionPending(false); return; }
+
+      const isRequester = request.requesterId === userId;
+      const alreadyRecorded = isRequester ? request.requesterAudioUrl : request.partnerAudioUrl;
+      if (alreadyRecorded) { setUnlockActionPending(false); return; }
+
+      // Stamp recording_started_at BEFORE mic opens so server can compare simultaneity
       const recordingStartedAt = new Date().toISOString();
       const role = isRequester ? 'requester' : 'partner';
       await supabase.from('unlock_requests').update(
@@ -595,6 +625,7 @@ export default function App() {
           : { partner_recording_started_at: recordingStartedAt, status: 'recording' }
       ).eq('id', request.id);
 
+      console.log(`[Unlock:shared] Recording started at ${recordingStartedAt}`);
       setUnlockStatus(UNLOCK_STATUS.RECORDING);
 
       let audioBlob, detected;
@@ -620,92 +651,74 @@ export default function App() {
         return;
       }
 
-      setUnlockStatus(UNLOCK_STATUS.VERIFYING);
-      const formData = new FormData();
       const ext = audioBlob.type.includes('ogg') ? 'ogg' : 'webm';
-      formData.append('audio', audioBlob, `audio.${ext}`);
-      formData.append('user_id', userId);
+      const storagePath = `${request.id}_${role}.${ext}`;
+      console.log(`[Unlock:shared] Uploading to i-agree/${storagePath}...`);
+      setUnlockStatus(UNLOCK_STATUS.UPLOADING);
 
-      let verifyResp, verifyData;
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000);
-        verifyResp = await fetch(`${BACKEND_URL}/verify-me`, { method: 'POST', body: formData, signal: controller.signal });
-        clearTimeout(timeout);
-        verifyData = await verifyResp.json();
-      } catch (fetchErr) {
-        const msg = fetchErr?.name === 'AbortError' ? 'Server timed out.' : 'Could not reach the server.';
-        setVerifyError(msg);
-        setUnlockStatus(UNLOCK_STATUS.ERROR);
-        setUnlockActionPending(false);
-        return;
-      }
+      const { error: upErr } = await supabase.storage
+        .from('i-agree')
+        .upload(storagePath, audioBlob, { contentType: audioBlob.type, upsert: true });
+      if (upErr) throw new Error(`Upload failed: ${upErr.message}`);
 
-      if (!verifyData.success) {
-        setVerifyError(verifyData.error || 'Voice verification failed.');
-        setUnlockStatus(UNLOCK_STATUS.ERROR);
-        setUnlockActionPending(false);
-        await supabase.from('unlock_requests').update({ status: 'verification_failed' }).eq('id', request.id);
-        return;
-      }
+      const audioUrl = supabase.storage.from('i-agree').getPublicUrl(storagePath).data.publicUrl;
+      const now = new Date().toISOString();
+      const audioPayload = isRequester
+        ? { requester_audio_url: audioUrl, requester_agreed_at: now }
+        : { partner_audio_url: audioUrl, partner_agreed_at: now };
 
-      // Voice matched — show indicator
-      setUnlockStatus(UNLOCK_STATUS.VOICE_MATCHED);
-      await new Promise(r => setTimeout(r, 1200));
-
-      // Write verified=true + agreed_at
-      const agreedAt = new Date().toISOString();
       const { data: updated, error: updateErr } = await supabase
-        .from('unlock_requests')
-        .update(isRequester
-          ? { requester_verified: true, requester_agreed_at: agreedAt }
-          : { partner_verified: true, partner_agreed_at: agreedAt })
-        .eq('id', request.id)
-        .select()
-        .single();
+        .from('unlock_requests').update(audioPayload).eq('id', request.id).select().single();
       if (updateErr) throw updateErr;
+      setActiveUnlockRequest(mapUnlockRequest(updated));
 
-      const mappedUpdated = mapUnlockRequest(updated);
-      setActiveUnlockRequest(mappedUpdated);
+      const bothReady = !!(updated.requester_audio_url && updated.partner_audio_url);
 
-      const bothVerified = mappedUpdated.requesterVerified && mappedUpdated.partnerVerified;
-
-      if (!bothVerified) {
-        await supabase.from('unlock_requests').update({ status: 'waiting_partner' }).eq('id', request.id);
+      if (!bothReady) {
+        // Uploaded first — update DB status to waiting and hold
+        await supabase.from('unlock_requests')
+          .update({ status: 'waiting_partner' })
+          .eq('id', request.id);
         setUnlockStatus(UNLOCK_STATUS.WAITING_PARTNER);
-        // Keep unlockActionPending=true so button stays disabled while waiting
-        return;
-      }
-
-      // Both verified — this user calls the timing check
-      await supabase.from('unlock_requests').update({ status: 'verifying' }).eq('id', request.id);
-      setUnlockStatus(UNLOCK_STATUS.VERIFYING);
-
-      let timingResp, timingData;
-      try {
-        timingResp = await fetch(`${BACKEND_URL}/verify-shared-unlock`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ request_id: request.id }),
-        });
-        timingData = await timingResp.json();
-      } catch (fetchErr) {
-        setVerifyError('Could not reach the server for the final check.');
-        setUnlockStatus(UNLOCK_STATUS.ERROR);
-        setUnlockActionPending(false);
-        return;
-      }
-
-      if (!timingData.success) {
-        setVerifyError(timingData.error || 'Consent timing check failed.');
-        setUnlockStatus(UNLOCK_STATUS.ERROR);
       } else {
-        const unlockedAt = new Date().toISOString();
-        setActiveUnlockRequest((cur) => {
-          if (!cur || cur.id !== request.id) return cur;
-          return { ...cur, status: 'unlocked', unlockedAt };
-        });
-        setUnlockStatus(null);
+        // Both audio files are present — whoever uploaded last drives verification
+        // First update DB status so both users see "verifying" via realtime
+        await supabase.from('unlock_requests')
+          .update({ status: 'verifying' })
+          .eq('id', request.id);
+
+        console.log(`[Unlock:shared] Both ready — ${role} calling /verify-shared-unlock...`);
+        setUnlockStatus(UNLOCK_STATUS.VERIFYING);
+
+        let resp, verifyData;
+        try {
+          resp = await fetch(`${BACKEND_URL}/verify-shared-unlock`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ request_id: request.id }),
+          });
+          verifyData = await resp.json();
+        } catch (fetchErr) {
+          setVerifyError('Could not reach the server.');
+          setUnlockStatus(UNLOCK_STATUS.ERROR);
+          setUnlockActionPending(false);
+          return;
+        }
+
+        if (!verifyData.success) {
+          const msg = verifyData.error || 'Shared voice verification failed.';
+          setVerifyError(msg);
+          setUnlockStatus(UNLOCK_STATUS.ERROR);
+          // DB is updated to verification_failed by the server via _mark_verification_failed
+        } else {
+          // Immediately flip local status — realtime will sync the other user
+          const unlockedAt = new Date().toISOString();
+          setActiveUnlockRequest((cur) => {
+            if (!cur || cur.id !== request.id) return cur;
+            return { ...cur, status: 'unlocked', unlockedAt };
+          });
+          setUnlockStatus(null);
+        }
       }
     } catch (err) {
       setVerifyError(typeof err?.message === 'string' ? err.message : 'Verification failed.');
@@ -723,7 +736,7 @@ export default function App() {
       if (row?.requester_id !== userId && row?.partner_id !== userId) return;
       const mapped = mapUnlockRequest(row);
 
-      // Terminal: declined
+      // Terminal: declined — show declined state, user must close manually
       if (mapped.status === 'declined') {
         setActiveUnlockRequest((cur) => cur?.id === mapped.id ? { ...cur, status: 'declined' } : cur);
         setUnlockStatus(UNLOCK_STATUS.DECLINED);
@@ -738,36 +751,24 @@ export default function App() {
         return;
       }
 
-      // Terminal: unlocked — partner receives this via realtime after the other user calls verify-shared-unlock
+      // Terminal: unlocked — partner receives this via realtime after requester verifies
       if (mapped.status === 'unlocked') {
         setActiveUnlockRequest((cur) => cur?.id === mapped.id ? { ...cur, status: 'unlocked' } : cur);
-        setUnlockStatus(null); // completedUnlockId effect handles markUnlocked
+        setUnlockStatus(null); // let completedUnlockId effect handle markUnlocked
         return;
       }
 
-      // In-progress: waiting_partner — only update the UI of the user who already verified.
-      // The other user is still recording/verifying; ignore so their flow isn't interrupted.
+      // In-progress: waiting_partner — this user uploaded first, waiting for the other
       if (mapped.status === 'waiting_partner') {
-        const myVerified = mapped.requesterId === userId
-          ? mapped.requesterVerified
-          : mapped.partnerVerified;
-        if (myVerified) {
-          setActiveUnlockRequest((cur) => cur?.id === mapped.id ? { ...cur, status: 'waiting_partner' } : cur);
-          setUnlockStatus(UNLOCK_STATUS.WAITING_PARTNER);
-        }
-        // else: this user hasn't verified yet — let their recording flow continue uninterrupted
+        setActiveUnlockRequest((cur) => cur?.id === mapped.id ? { ...cur, status: 'waiting_partner' } : cur);
+        setUnlockStatus(UNLOCK_STATUS.WAITING_PARTNER);
         return;
       }
 
-      // In-progress: verifying — update only the user not already in verifying state
-      // (the user who called the endpoint set it locally already)
+      // In-progress: verifying — both uploaded, the other user is running verification
       if (mapped.status === 'verifying') {
-        setActiveUnlockRequest((cur) => {
-          if (!cur || cur.id !== mapped.id) return cur;
-          if (cur.status === 'verifying') return cur; // already set locally
-          return { ...cur, status: 'verifying' };
-        });
-        setUnlockStatus((prev) => prev === UNLOCK_STATUS.VERIFYING ? prev : UNLOCK_STATUS.VERIFYING);
+        setActiveUnlockRequest((cur) => cur?.id === mapped.id ? { ...cur, status: 'verifying' } : cur);
+        setUnlockStatus(UNLOCK_STATUS.VERIFYING);
         return;
       }
 
@@ -791,6 +792,9 @@ export default function App() {
       setSharedMessages((shared ?? []).map(mapMessage));
       setPendingInvitations((invites ?? []).map(mapInvitation));
 
+      // Only restore an unlock overlay if the users row has an explicit active request ID.
+      // This is set when a request is created/accepted and cleared on resolve/decline —
+      // so stale rows from past sessions will never re-surface here.
       const activeId = userData?.active_unlock_request_id;
       if (activeId) {
         const { data: unlockRow, error: unlockErr } = await supabase
@@ -802,15 +806,18 @@ export default function App() {
             setActiveTab('us');
             setActiveUnlockRequest(mapped);
           } else {
+            // Row exists but is no longer active (e.g. timed out) — clean up the pointer
             console.log('[App] Stale active_unlock_request_id found, clearing it.');
             await setUserActiveUnlock(userId, null);
           }
         } else {
+          // Row was deleted — clean up the pointer
           await setUserActiveUnlock(userId, null);
         }
       }
     })();
 
+    // Two filters needed: one for messages I sent, one for messages sent to me
     const privateMessagesChannel = supabase
       .channel('private-messages-channel')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `sender=eq.${userId}` }, (payload) => {
@@ -834,7 +841,7 @@ export default function App() {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
         const msg = payload.new;
         if (msg.type !== 'shared') return;
-        const mapped = mapMessage(msg);
+        const mapped = mapMessage(msg); // mapMessage normalises participants to an array
         if (!mapped.participants.includes(userIdRef.current)) return;
         setSharedMessages((prev) => prev.some((m) => m.id === mapped.id) ? prev : [mapped, ...prev]);
       })
@@ -899,6 +906,8 @@ export default function App() {
     };
   }, [isUnlocked]);
 
+  // Tracks whether we've already auto-fired recording for a given request,
+  // so the 250ms tick doesn't trigger it multiple times.
   const autoRecordFiredRef = useRef(null);
 
   useEffect(() => {
@@ -916,7 +925,7 @@ export default function App() {
     if (unlockActionPendingRef.current) return;
     const remaining = getCountdownRemaining(activeUnlockRequest.countdownStartedAt, unlockNow);
     if (remaining > 0) return;
-    if (autoRecordFiredRef.current === activeUnlockRequest.id) return;
+    if (autoRecordFiredRef.current === activeUnlockRequest.id) return; // already fired
     autoRecordFiredRef.current = activeUnlockRequest.id;
     console.log('[Unlock:shared] Countdown hit 0 — auto-starting recording');
     recordUnlockAgreement();
@@ -929,6 +938,7 @@ export default function App() {
     if (!completedUnlockId) return;
     const req = activeUnlockRequest;
     markUnlocked(req?.kind === 'shared' ? 'shared' : 'private');
+    // Clear the pointer on both users — request is resolved
     if (req?.kind === 'shared') {
       Promise.all([
         setUserActiveUnlock(req.requesterId, null),
@@ -937,6 +947,7 @@ export default function App() {
     } else if (req?.kind === 'private') {
       setUserActiveUnlock(userId, null);
     }
+    // Overlay stays open — user closes it manually via the Close button
   }, [completedUnlockId, markUnlocked, userId]);
 
   const sendInvitation = useCallback(async (toId) => {
@@ -1042,7 +1053,7 @@ export default function App() {
 
           {activeTab === 'us' && (
             partnerId ? (
-              <div className="px-3 py-3 space-y-2 overflow-y-auto h-full scrollbar-thin scrollbar-thumb-[#21273a] scrollbar-track-[#0d1117]">
+              <div className="px-3 py-3 space-y-2 overflow-y-auto h-48 scrollbar-thin scrollbar-thumb-[#21273a] scrollbar-track-[#0d1117]">
                 {usMessages.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-48 text-center gap-2 select-none">
                     <span className="text-3xl opacity-20">🔒</span>

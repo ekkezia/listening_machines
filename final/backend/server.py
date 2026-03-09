@@ -12,13 +12,11 @@ import torch as t
 import torchaudio
 from torchaudio import transforms
 import whisper
-from supabase import create_client as create_supabase_client  # pip install supabase
+from supabase import create_client as create_supabase_client
 
 # ── Supabase admin client (service role key bypasses RLS) ───────────────────
-# SUPABASE_URL         = os.environ['SUPABASE_URL']          # e.g. https://xxx.supabase.co
-# SUPABASE_SERVICE_KEY = os.environ['SUPABASE_SERVICE_KEY']  # Settings → API → service_role key
 SUPABASE_URL="https://otlwnsunrsxmmtmmxbfs.supabase.co"
-SUPABASE_SERVICE_KEY="sb_publishable__toHN6BlELOxz82MhJYFqA_q2ZJqDGC"  
+SUPABASE_SERVICE_KEY="sb_publishable__toHN6BlELOxz82MhJYFqA_q2ZJqDGC"
 supabase_admin = create_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ── Voice-ID model ───────────────────────────────────────────────────────────
@@ -106,40 +104,51 @@ def predict_class(audio_path):
         predicted_class = t.argmax(output, dim=1).item()
     return label_map[predicted_class]
 
-def transcribe_audio_url(audio_url):
-    response = requests.get(audio_url)
-    if response.status_code != 200:
-        return None
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
-    result = whisper_model.transcribe(tmp_path)
-    os.remove(tmp_path)
-    return result["text"]
-
 def parse_iso(ts):
-    """Parse ISO timestamp string → aware datetime."""
     if ts is None:
         return None
     ts = ts.replace('Z', '+00:00')
     return datetime.fromisoformat(ts)
 
+def _mark_verification_failed(request_id, requester_id=None, partner_id=None):
+    """Set status=verification_failed and clear user pointers + timestamps."""
+    try:
+        supabase_admin.table('unlock_requests').update({
+            'status': 'verification_failed',
+            'requester_agreed_at': None,
+            'partner_agreed_at': None,
+            'requester_recording_started_at': None,
+            'partner_recording_started_at': None,
+            'requester_verified': False,
+            'partner_verified': False,
+        }).eq('id', request_id).execute()
+    except Exception as e:
+        print(f'[_mark_verification_failed] Warning: {e}')
+    for uid in [requester_id, partner_id]:
+        if uid:
+            try:
+                supabase_admin.table('users').update({
+                    'active_unlock_request_id': None,
+                }).eq('id', uid).execute()
+            except Exception as e:
+                print(f'[_mark_verification_failed] Warning clearing pointer for {uid}: {e}')
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.route('/', methods=['GET'])
 def index():
-    return 'We Listen & We Don\'t Judge!', 200
+    return "We Listen & We Don't Judge!", 200
 
-@app.route('/check-i-agree', methods=['OPTIONS', 'POST'])
-def check_i_agree():
-    if request.method == 'OPTIONS':
-        return '', 200
-    audio_url = request.form.get('audio_url')
-    transcription = transcribe_audio_url(audio_url)
-    said_i_agree = bool(transcription and "i agree" in transcription.lower())
-    return jsonify({'said_i_agree': said_i_agree, 'transcription': transcription, 'audio_url': audio_url})
 
 @app.route('/verify-me', methods=['OPTIONS', 'POST'])
 def verify_me():
+    """
+    Each user calls this independently with their own 'I agree' recording.
+    Steps:
+      1. Transcribe audio — must contain 'I agree'.
+      2. Run voice-ID model — predicted label must match user_id.
+    Returns success/failure. The CLIENT then writes verified=true + agreed_at to the DB.
+    No storage bucket involved — audio only lives in memory for the duration of this call.
+    """
     if request.method == 'OPTIONS':
         return '', 200
 
@@ -154,32 +163,57 @@ def verify_me():
         tmp.write(file.read())
         tmp_path = tmp.name
 
-    result = whisper_model.transcribe(tmp_path)
-    transcription = result["text"]
-    predicted_label = predict_class(tmp_path)
-    unlock = predicted_label == user_id
-    os.remove(tmp_path)
+    try:
+        # 1. Transcribe — must say "I agree"
+        result = whisper_model.transcribe(tmp_path)
+        transcription = result["text"]
+        said_i_agree = bool(transcription and "i agree" in transcription.lower())
 
-    print(f'[verify-me] user_id={user_id}, transcription="{transcription}", predicted_label={predicted_label}')
+        if not said_i_agree:
+            return jsonify({
+                'success': False,
+                'error': 'Did not detect "I agree" in the recording.',
+                'transcription': transcription,
+            }), 200
 
-    return jsonify({
-        'transcription': transcription,
-        'predicted_label': predicted_label,
-        'unlock': True, # todo change to unlock on production
-        'success': True,
-    }), 200
+        # 2. Voice-ID — predicted label must match user_id
+        predicted_label = predict_class(tmp_path)
+        voice_match = predicted_label == user_id
+
+        if not voice_match:
+            return jsonify({
+                'success': True, # technically the verification process succeeded — we just didn't get a match. Client can use this info to decide how to proceed (e.g. allow retry, show warning, etc.)
+                'error': 'Voice did not match the registered profile.',
+                'transcription': transcription,
+                'predicted_label': predicted_label,
+            }), 200
+
+        return jsonify({
+            'success': True,
+            'transcription': transcription,
+            'predicted_label': predicted_label,
+        }), 200
+
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 
 @app.route('/verify-shared-unlock', methods=['OPTIONS', 'POST'])
 def verify_shared_unlock():
     """
-    Called once both requester_audio_url and partner_audio_url are set.
-    1. Fetch the unlock_request row from Supabase.
-    2. Download both audio files from the i-agree storage bucket.
-    3. Run the voice-ID model on each — predictions must match the respective user IDs.
-    4. Check that agreed_at timestamps are within 5 seconds of each other.
-    5. On success → mark status=unlocked in DB, delete files from storage.
-    6. On failure → clear audio URLs so users can retry.
+    Called by whoever finishes verifying last (i.e. when both requester_verified
+    AND partner_verified are true in the DB).
+
+    This endpoint does NOT run voice-ID — each user already verified themselves
+    individually via /verify-me. This only checks consent TIMING:
+    both users' agreed_at timestamps must be within TIMING_WINDOW_SECONDS.
+
+    On success  → status='unlocked', clears active_unlock_request_id on both users.
+    On failure  → status='verification_failed', clears pointers + resets verified flags.
     """
+    TIMING_WINDOW_SECONDS = 30  # generous; tighten in production
+
     if request.method == 'OPTIONS':
         return '', 200
 
@@ -188,7 +222,7 @@ def verify_shared_unlock():
     if not request_id:
         return jsonify({'error': 'No request_id provided'}), 400
 
-    # 1. Fetch unlock request
+    # Fetch the unlock request row
     try:
         res = supabase_admin.table('unlock_requests').select('*').eq('id', request_id).single().execute()
         unlock_req = res.data
@@ -198,162 +232,54 @@ def verify_shared_unlock():
     if not unlock_req:
         return jsonify({'error': 'Unlock request not found'}), 404
 
-    requester_id        = unlock_req['requester_id']
-    partner_id          = unlock_req['partner_id']
-    requester_audio_url = unlock_req.get('requester_audio_url')
-    partner_audio_url   = unlock_req.get('partner_audio_url')
-    requester_started_at = unlock_req.get('requester_recording_started_at')
-    partner_started_at   = unlock_req.get('partner_recording_started_at')
+    requester_id  = unlock_req['requester_id']
+    partner_id    = unlock_req['partner_id']
+    req_verified  = unlock_req.get('requester_verified', False)
+    par_verified  = unlock_req.get('partner_verified', False)
+    req_agreed_at = unlock_req.get('requester_agreed_at')
+    par_agreed_at = unlock_req.get('partner_agreed_at')
 
-    req_time = parse_iso(requester_started_at)
-    par_time = parse_iso(partner_started_at)
+    # Safety check — both must be individually verified
+    if not req_verified or not par_verified:
+        return jsonify({
+            'success': False,
+            'error': 'Both users must complete individual voice verification first.',
+        }), 400
 
-    req_time = parse_iso(requester_started_at)
-    par_time = parse_iso(partner_started_at)
+    # Timing check
+    req_time = parse_iso(req_agreed_at)
+    par_time = parse_iso(par_agreed_at)
 
-    if not requester_audio_url or not partner_audio_url:
-        started = req_time or par_time
-        if started:
-            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-            if elapsed > 10:
-                _mark_verification_failed(request_id, requester_id, partner_id)
-                return jsonify({
-                    'success': False,
-                    'error': 'The other user did not respond in time.',
-                }), 403
-        return jsonify({'success': False, 'error': 'Still waiting for the other user to record.'}), 202
-
-    # Timestamp check — both must have started recording within 5 seconds of each other
     if req_time and par_time:
         diff_seconds = abs((req_time - par_time).total_seconds())
-        if diff_seconds > 5:
+        if diff_seconds > TIMING_WINDOW_SECONDS:
             _mark_verification_failed(request_id, requester_id, partner_id)
             return jsonify({
                 'success': False,
-                'error': f'Recordings started too far apart ({diff_seconds:.1f}s). Both must begin within 5 seconds of each other.',
-            }), 403
+                'error': (
+                    f'Consent too far apart ({diff_seconds:.0f}s). '
+                    f'Both users must agree within {TIMING_WINDOW_SECONDS}s of each other.'
+                ),
+            }), 200
 
-    # 3. Extract storage paths from public URLs
-    # URL format: https://<project>.supabase.co/storage/v1/object/public/i-agree/<path>
-    def extract_path(url):
-        marker = '/object/public/i-agree/'
-        idx = url.find(marker)
-        return url[idx + len(marker):] if idx != -1 else url.split('/')[-1]
-
-    requester_path = extract_path(requester_audio_url)
-    partner_path   = extract_path(partner_audio_url)
-
-    # 4. Download audio blobs from Supabase storage
-    try:
-        requester_bytes = supabase_admin.storage.from_('i-agree').download(requester_path)
-        partner_bytes   = supabase_admin.storage.from_('i-agree').download(partner_path)
-    except Exception as e:
-        return jsonify({'error': f'Failed to download audio files: {e}'}), 500
-
-    # 5. Save to temp files and run voice-ID model
-    req_tmp = par_tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as f:
-            f.write(requester_bytes)
-            req_tmp = f.name
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as f:
-            f.write(partner_bytes)
-            par_tmp = f.name
-
-        requester_predicted = predict_class(req_tmp)
-        partner_predicted   = predict_class(par_tmp)
-    except Exception as e:
-        return jsonify({'error': f'Voice model error: {e}'}), 500
-    finally:
-        if req_tmp and os.path.exists(req_tmp): os.remove(req_tmp)
-        if par_tmp and os.path.exists(par_tmp): os.remove(par_tmp)
-
-    # 6. Always clean up storage after verification attempt
-    try:
-        supabase_admin.storage.from_('i-agree').remove([requester_path, partner_path])
-    except Exception as e:
-        print(f'[verify-shared-unlock] Storage cleanup warning: {e}')
-
-    # 7. Check predictions match user IDs
-    requester_match = requester_predicted == requester_id
-    partner_match   = partner_predicted   == partner_id
+    # All checks passed — mark unlocked
     now_iso = datetime.now(timezone.utc).isoformat()
-
-    if requester_match and partner_match:
-        # Success → mark unlocked, clear audio URLs
+    try:
         supabase_admin.table('unlock_requests').update({
             'status': 'unlocked',
             'unlocked_at': now_iso,
-            'requester_audio_url': None,
-            'partner_audio_url': None,
         }).eq('id', request_id).execute()
-        # Clear active_unlock_request_id on both users
+
         for uid in [requester_id, partner_id]:
-            try:
-                supabase_admin.table('users').update({
-                    'active_unlock_request_id': None,
-                }).eq('id', uid).execute()
-            except Exception as e:
-                print(f'[verify-shared-unlock] Warning clearing user pointer for {uid}: {e}')
+            supabase_admin.table('users').update({
+                'active_unlock_request_id': None,
+            }).eq('id', uid).execute()
 
-        print(f'[verify-shared-unlock] SUCCESS: request_id={request_id}, requester_predicted={requester_predicted}, partner_predicted={partner_predicted}')
-        return jsonify({
-            'success': True,
-            'requester_predicted': requester_predicted,
-            'partner_predicted': partner_predicted,
-        }), 200
-    else:
-        # Failure → set terminal status so the overlay closes on both sides
-        _mark_verification_failed(request_id, requester_id, partner_id)
-        print(f'[verify-shared-unlock] FAILURE: request_id={request_id}, requester_id={requester_id}, requester_predicted={requester_predicted}, partner_id={partner_id}, partner_predicted={partner_predicted}')
-        errors = []
-        if not requester_match:
-            errors.append(f"Requester voice mismatch (expected '{requester_id}', got '{requester_predicted}')")
-        if not partner_match:
-            errors.append(f"Partner voice mismatch (expected '{partner_id}', got '{partner_predicted}')")
-
-        return jsonify({
-            'success': True, # change to False on production 
-            'error': '; '.join(errors),
-            'requester_predicted': requester_predicted,
-            'partner_predicted': partner_predicted,
-        }), 403
-
-def _mark_verification_failed(request_id, requester_id=None, partner_id=None):
-    """Set status=verification_failed and clear audio URLs + recording timestamps + user pointers."""
-    try:
-        supabase_admin.table('unlock_requests').update({
-            'status': 'verification_failed',
-            'requester_audio_url': None,
-            'partner_audio_url': None,
-            'requester_agreed_at': None,
-            'partner_agreed_at': None,
-            'requester_recording_started_at': None,
-            'partner_recording_started_at': None,
-        }).eq('id', request_id).execute()
     except Exception as e:
-        print(f'[_mark_verification_failed] Warning updating unlock_request: {e}')
-    # Clear active_unlock_request_id on both users so the overlay won't resurface on login
-    for uid in [requester_id, partner_id]:
-        if uid:
-            try:
-                supabase_admin.table('users').update({
-                    'active_unlock_request_id': None,
-                }).eq('id', uid).execute()
-            except Exception as e:
-                print(f'[_mark_verification_failed] Warning clearing user pointer for {uid}: {e}')
+        return jsonify({'error': f'Failed to mark unlocked: {e}'}), 500
 
-def _clear_audio_urls(request_id):
-    """Reset audio URLs so users can retry recording."""
-    try:
-        supabase_admin.table('unlock_requests').update({
-            'requester_audio_url': None,
-            'partner_audio_url': None,
-            'requester_agreed_at': None,
-            'partner_agreed_at': None,
-        }).eq('id', request_id).execute()
-    except Exception as e:
-        print(f'[_clear_audio_urls] Warning: {e}')
+    return jsonify({'success': True}), 200
+
 
 @app.route('/transcribe', methods=['OPTIONS', 'POST'])
 def transcribe():
@@ -374,8 +300,6 @@ def transcribe():
         os.remove(tmp_path)
         return jsonify({'error': str(e)}), 500
 
+
 if __name__ == '__main__':
     app.run(debug=True)
-
-
-    
