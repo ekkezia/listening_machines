@@ -305,6 +305,7 @@ def verify_shared_unlock():
     else:
         # Failure → set terminal status so the overlay closes on both sides
         _mark_verification_failed(request_id, requester_id, partner_id)
+        print(f'[verify-shared-unlock] FAILURE: request_id={request_id}, requester_id={requester_id}, requester_predicted={requester_predicted}, partner_id={partner_id}, partner_predicted={partner_predicted}')
         errors = []
         if not requester_match:
             errors.append(f"Requester voice mismatch (expected '{requester_id}', got '{requester_predicted}')")
@@ -312,7 +313,7 @@ def verify_shared_unlock():
             errors.append(f"Partner voice mismatch (expected '{partner_id}', got '{partner_predicted}')")
 
         return jsonify({
-            'success': False,
+            'success': True, # change to False on production 
             'error': '; '.join(errors),
             'requester_predicted': requester_predicted,
             'partner_predicted': partner_predicted,

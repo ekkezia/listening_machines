@@ -27,10 +27,16 @@ export const UNLOCK_STATUS = {
 
 const mapMessage = (row) => ({
   id: row.id,
+  type: row.type ?? '',
+  sender: row.sender ?? null,
+  recipient: row.recipient ?? null,
   timestamp: row.timestamp,
   transcription: row.transcription,
   duration: row.duration ?? 0,
   data: row.data ?? '',
+  participants: Array.isArray(row.participants)
+    ? row.participants
+    : (() => { try { return JSON.parse(row.participants ?? '[]'); } catch { return []; } })(),
 });
 
 const mapInvitation = (row) => ({
@@ -135,39 +141,33 @@ const saveMessage = async (data) => {
 };
 
 /**
- * Opens the mic and records until the Web Speech API fires a 'voiceCommand'
- * event containing "i agree", then stops and returns { blob, detected }.
- * Falls back after timeoutMs (default 15s) even if nothing is heard.
- * detected=false on timeout so callers can surface a clear error.
- */
-/**
- * Pauses the Speech API recogniser, opens a fresh mic stream for MediaRecorder,
- * then re-starts recognition on that SAME stream so "i agree" can still be
- * detected while we record — no competing getUserMedia calls.
+ * Records audio until the always-on SpeechRecognition (useVoiceRecognition) fires
+ * a voiceCommand event containing "i agree", then returns { blob, detected }.
  *
- * Flow:
- *  1. Pause recogniser (releases browser's exclusive mic lock)
- *  2. getUserMedia → stream
- *  3. Start MediaRecorder on stream
- *  4. Start a NEW SpeechRecognition instance pointed at the same stream
- *     (via AudioContext source trick not needed — browser shares hw mic fine
- *      once the old instance is fully stopped)
- *  5. On "i agree" → stop recorder → resume main recogniser
- *  6. Timeout fallback at timeoutMs
+ * Does NOT pause the main recogniser — it stays running so it can detect "i agree".
+ * Opens a separate getUserMedia stream purely for MediaRecorder (audio capture).
+ * On desktop Chrome two concurrent mic consumers work fine; on mobile we fall back
+ * gracefully if getUserMedia fails while Speech API holds the mic.
+ *
+ * Timeout fallback at timeoutMs (default 15s).
  */
 const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, reject) => {
-  // Pause the always-on recogniser so the browser releases mic exclusivity
-  window._darwinPause?.();
-  // Small gap to let the browser fully release the mic before we re-open it
-  await new Promise(r => setTimeout(r, 250));
-
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (err) {
-    window._darwinResume?.();
-    reject(new Error('Microphone access denied: ' + err.message));
-    return;
+    // On some mobile browsers the Speech API holds exclusive mic access.
+    // Pause it, wait, then retry once.
+    console.warn('[recordUntilIAgree] First getUserMedia failed, pausing Speech API and retrying:', err.message);
+    window._darwinPause?.();
+    await new Promise(r => setTimeout(r, 400));
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    } catch (err2) {
+      window._darwinResume?.();
+      reject(new Error('Microphone access denied: ' + err2.message));
+      return;
+    }
   }
 
   const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg']
@@ -182,31 +182,7 @@ const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, rej
   };
 
   recorder.start();
-  console.log('[recordUntilIAgree] Recording started, mimeType:', mimeType || 'browser default');
-
-  // Spin up a dedicated short-lived recogniser for "i agree" detection
-  // (the main recogniser is paused; this one runs only during recording)
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let localRec = null;
-  if (SR) {
-    localRec = new SR();
-    localRec.lang           = 'en-US';
-    localRec.continuous     = true;
-    localRec.interimResults = false;
-    localRec.onresult = (event) => {
-      const transcript = Array.from(event.results)
-        .slice(event.resultIndex)
-        .filter(r => r.isFinal)
-        .map(r => r[0].transcript.trim().toLowerCase())
-        .join(' ');
-      if (!transcript) return;
-      console.log('[recordUntilIAgree] localRec heard:', transcript);
-      // Dispatch so the existing onVoiceCommand listener below picks it up
-      window.dispatchEvent(new CustomEvent('voiceCommand', { detail: transcript }));
-    };
-    localRec.onerror = (e) => console.warn('[recordUntilIAgree] localRec error:', e.error);
-    try { localRec.start(); } catch (e) { console.warn('[recordUntilIAgree] localRec start failed:', e); }
-  }
+  console.log('[recordUntilIAgree] Recording started. Waiting for "i agree"...');
 
   let detected = false;
   let stopped = false;
@@ -216,14 +192,13 @@ const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, rej
     stopped = true;
     clearTimeout(hardTimeout);
     window.removeEventListener('voiceCommand', onVoiceCommand);
-    if (localRec) { try { localRec.abort(); } catch (_) {} localRec = null; }
     if (recorder.state === 'recording') recorder.stop();
   };
 
   const onVoiceCommand = (e) => {
     const cmd = typeof e.detail === 'string' ? e.detail : '';
     if (cmd.includes('i agree')) {
-      console.log('[recordUntilIAgree] "i agree" detected — stopping');
+      console.log('[recordUntilIAgree] "i agree" detected — stopping recorder');
       detected = true;
       stop();
     }
@@ -237,25 +212,16 @@ const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, rej
 
   await new Promise(r => { recorder.onstop = r; });
   stream.getTracks().forEach(t => t.stop());
-  // Resume the always-on recogniser now that we're done with the mic
-  window._darwinResume?.();
+  window._darwinResume?.(); // resume if we had to pause for the retry
   const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
   console.log('[recordUntilIAgree] Done. detected:', detected, 'blob:', blob.size, 'bytes');
   resolve({ blob, detected });
 });
 
+
 export default function App() {
   const [userId, setUserId] = useState('');
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-
-  // Auto-login if userId is present in sessionStorage
-  useEffect(() => {
-    const storedUserId = sessionStorage.getItem('userId');
-    if (storedUserId && !isLoggedIn) {
-      setUserId(storedUserId);
-      setIsLoggedIn(true);
-    }
-  }, [isLoggedIn]);
   const [activeTab, setActiveTab] = useState('me');
   const [recordingState, setRecordingState] = useState('idle');
   const [privateMessages, setPrivateMessages] = useState([]);
@@ -329,7 +295,7 @@ export default function App() {
   }, []);
 
   const beginRecording = useCallback(async (type) => {
-    if (recordingState === 'recording') return;
+    if (recordingState === 'recording' || recordingState === 'uploading') return;
     if (activeUnlockRequestRef.current && !isUnlockRequestComplete(activeUnlockRequestRef.current)) {
       setVerifyError('Finish the unlock consent prompt first.');
       return;
@@ -357,7 +323,7 @@ export default function App() {
     const meta = pendingRecordRef.current;
     if (!meta) return;
     pendingRecordRef.current = null;
-    setRecordingState('idle');
+    setRecordingState('uploading'); // keep button disabled during upload + transcribe
 
     const result = await stopAndUpload(meta.type, { upload: true, transcribe: false });
 
@@ -385,13 +351,17 @@ export default function App() {
       transcription,
     });
 
-    if (!inserted) return;
+    if (!inserted) {
+      setRecordingState('idle');
+      return;
+    }
     const mapped = mapMessage(inserted);
     if (meta.type === 'private') {
       setPrivateMessages((prev) => prev.some((m) => m.id === mapped.id) ? prev : [mapped, ...prev]);
     } else {
       setSharedMessages((prev) => prev.some((m) => m.id === mapped.id) ? prev : [mapped, ...prev]);
     }
+    setRecordingState('idle');
   }, [stopAndUpload]);
 
   const startPrivateUnlockFlow = useCallback(async () => {
@@ -761,8 +731,8 @@ export default function App() {
 
     (async () => {
       const [{ data: priv }, { data: shared }, { data: invites }, { data: userData }] = await Promise.all([
-        supabase.from('messages').select('*').eq('sender', userId).eq('type', 'private').order('timestamp', { ascending: false }),
-        supabase.from('messages').select('*').contains('participants', [userId]).order('timestamp', { ascending: false }),
+        supabase.from('messages').select('*').eq('type', 'private').or(`sender.eq.${userId},recipient.eq.${userId}`).order('timestamp', { ascending: false }),
+        supabase.from('messages').select('*').eq('type', 'shared').order('timestamp', { ascending: false }),
         supabase.from('invitations').select('*').eq('to', userId).eq('status', 'pending'),
         supabase.from('users').select('active_unlock_request_id').eq('id', userId).single(),
       ]);
@@ -796,9 +766,19 @@ export default function App() {
       }
     })();
 
+    // Two filters needed: one for messages I sent, one for messages sent to me
     const privateMessagesChannel = supabase
       .channel('private-messages-channel')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `sender=eq.${userId}` }, (payload) => {
+        const msg = payload.new;
+        if (msg.type !== 'private') return;
+        setPrivateMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [mapMessage(msg), ...prev]);
+      })
+      .subscribe();
+
+    const privateMessagesReceivedChannel = supabase
+      .channel('private-messages-received-channel')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `recipient=eq.${userId}` }, (payload) => {
         const msg = payload.new;
         if (msg.type !== 'private') return;
         setPrivateMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [mapMessage(msg), ...prev]);
@@ -810,9 +790,9 @@ export default function App() {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
         const msg = payload.new;
         if (msg.type !== 'shared') return;
-        const participants = msg.participants ?? [];
-        if (!participants.includes(userIdRef.current)) return;
-        setSharedMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [mapMessage(msg), ...prev]);
+        const mapped = mapMessage(msg); // mapMessage normalises participants to an array
+        if (!mapped.participants.includes(userIdRef.current)) return;
+        setSharedMessages((prev) => prev.some((m) => m.id === mapped.id) ? prev : [mapped, ...prev]);
       })
       .subscribe();
 
@@ -841,6 +821,7 @@ export default function App() {
 
     return () => {
       privateMessagesChannel.unsubscribe();
+      privateMessagesReceivedChannel.unsubscribe();
       sharedMessagesChannel.unsubscribe();
       invitationChannel.unsubscribe();
       unlockChannel.unsubscribe();
@@ -967,7 +948,6 @@ export default function App() {
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
-    sessionStorage.removeItem('userId');
     setUserId(''); setIsLoggedIn(false); setPartnerId(null);
     setPrivateMessages([]); setSharedMessages([]); setPendingInvitations([]);
     setIsPrivateUnlocked(false); setIsSharedUnlocked(false); setLockCountdown(0); setRecordingState('idle');
@@ -976,15 +956,11 @@ export default function App() {
   };
 
   if (!isLoggedIn) {
-    return <LoginScreen onLogin={(id) => {
-      sessionStorage.setItem('userId', id);
-      setUserId(id);
-      setIsLoggedIn(true);
-    }} />;
+    return <LoginScreen onLogin={(id) => { setUserId(id); setIsLoggedIn(true); }} />;
   }
 
   const meMessages = privateMessages;
-  const usMessages = sharedMessages;
+  const usMessages = sharedMessages.filter((msg) => msg.participants.includes(userId));
   const emptyHint = activeTab === 'me'
     ? 'Say "record me" to record a private message'
     : 'Say "record for us" to share a message';

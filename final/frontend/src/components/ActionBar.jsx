@@ -3,6 +3,7 @@ import Soundwave from './Soundwave';
 const STATE_CONFIG = {
   idle:      { bg: 'bg-[#0d1117]', border: 'border-[#21273a]', label: 'Listening for commands', dot: 'bg-[#8892a4]' },
   recording: { bg: 'bg-[#2d0a0a]', border: 'border-[#ef4444]/40', label: 'Recording...', dot: 'bg-[#ef4444] animate-ping' },
+  uploading: { bg: 'bg-[#0d1a2d]', border: 'border-[#3b82f6]/40', label: 'Saving...', dot: 'bg-[#3b82f6] animate-pulse' },
   matching:  { bg: 'bg-[#2d1f00]', border: 'border-[#f59e0b]/40', label: 'Matching voice...', dot: 'bg-[#f59e0b] animate-pulse' },
   matched:   { bg: 'bg-[#062015]', border: 'border-[#10b981]/40', label: 'Voice matched!', dot: 'bg-[#10b981]' },
 };
@@ -24,6 +25,7 @@ export default function ActionBar({
 }) {
   const config = STATE_CONFIG[recordingState] || STATE_CONFIG.idle;
   const isRecording = recordingState === 'recording';
+  const isUploading = recordingState === 'uploading';
 
   // Which type to record depends on the active tab
   const recordType = activeTab === 'us' ? 'shared' : 'private';
@@ -69,16 +71,16 @@ export default function ActionBar({
             </button>
           ) : (
             <>
-              {/* Record button */}
+              {/* Record button — also disabled while uploading */}
               <button
                 onClick={() => onStartRecording(recordType)}
-                disabled={verifying || !canRecordUs || unlocking}
+                disabled={verifying || !canRecordUs || unlocking || isUploading}
                 className="cursor-pointer flex items-center gap-1.5 px-2.5 py-1 rounded-lg
                   bg-[#7c3aed]/20 border border-[#7c3aed]/40 text-[#7c3aed]
                   text-[10px] font-semibold hover:bg-[#7c3aed]/30
                   disabled:opacity-40 disabled:cursor-not-allowed transition-all">
                 <MicIcon />
-                Record
+                {isUploading ? 'Saving…' : activeTab === 'us' ? 'Record for us' : 'Record for me'}
               </button>
 
               {/* Lock indicator */}
@@ -109,4 +111,3 @@ export default function ActionBar({
     </div>
   );
 }
-
