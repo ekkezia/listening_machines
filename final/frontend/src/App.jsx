@@ -42,13 +42,15 @@ const mapInvitation = (row) => ({
 
 const mapUnlockRequest = (row) => ({
   id: row.id,
-  kind: 'shared',
+  kind: row.type ?? 'shared',
   requesterId: row.requester_id,
   partnerId: row.partner_id,
   status: row.status,
   countdownStartedAt: row.countdown_started_at,
   requesterAgreedAt: row.requester_agreed_at,
   partnerAgreedAt: row.partner_agreed_at,
+  requesterRecordingStartedAt: row.requester_recording_started_at ?? null,
+  partnerRecordingStartedAt: row.partner_recording_started_at ?? null,
   requesterAudioUrl: row.requester_audio_url ?? null,
   partnerAudioUrl: row.partner_audio_url ?? null,
   createdAt: row.created_at,
@@ -80,8 +82,9 @@ const getCountdownRemaining = (startedAt, now = Date.now()) => {
 
 const isUnlockRequestComplete = (request) => {
   if (!request) return false;
-  if (request.kind === 'private') return request.status === 'unlocked' || !!request.requesterAgreedAt;
-  return request.status === 'unlocked' || (!!request.requesterAgreedAt && !!request.partnerAgreedAt);
+  // Only trust status===unlocked set by server after verification.
+  // agreedAt fields are written before verification completes and must not trigger unlock.
+  return request.status === 'unlocked';
 };
 
 const isUnlockRequestCurrent = (request, now = Date.now()) => {
@@ -92,13 +95,22 @@ const isUnlockRequestCurrent = (request, now = Date.now()) => {
 const isUnlockRequestRelevant = (request, now = Date.now()) => {
   if (!request || !isUnlockRequestCurrent(request, now)) return false;
   if (isUnlockRequestComplete(request)) return true;
-  if (request.status === 'declined') return true; // show declined state briefly
-  return request.status === 'pending_partner' || request.status === 'countdown';
+  if (request.status === 'declined') return true;
+  if (request.status === 'verification_failed') return false; // terminal — don't re-show
+  return request.status === 'pending_partner' || request.status === 'countdown' || request.status === 'recording';
 };
 
 const isUnlockRequestActive = (request, now = Date.now()) => {
   if (!request || !isUnlockRequestCurrent(request, now) || isUnlockRequestComplete(request)) return false;
-  return request.status === 'pending_partner' || request.status === 'countdown';
+  return request.status === 'pending_partner' || request.status === 'countdown' || request.status === 'recording';
+};
+
+// Writes or clears active_unlock_request_id on the users row.
+// Pass null to clear it (request resolved/declined/errored).
+const setUserActiveUnlock = async (userId, requestId) => {
+  await supabase.from('users')
+    .update({ active_unlock_request_id: requestId })
+    .eq('id', userId);
 };
 
 const saveMessage = async (data) => {
@@ -122,14 +134,42 @@ const saveMessage = async (data) => {
   }
 };
 
-const recordShortClip = () => new Promise(async (resolve, reject) => {
+/**
+ * Opens the mic and records until the Web Speech API fires a 'voiceCommand'
+ * event containing "i agree", then stops and returns { blob, detected }.
+ * Falls back after timeoutMs (default 15s) even if nothing is heard.
+ * detected=false on timeout so callers can surface a clear error.
+ */
+/**
+ * Pauses the Speech API recogniser, opens a fresh mic stream for MediaRecorder,
+ * then re-starts recognition on that SAME stream so "i agree" can still be
+ * detected while we record — no competing getUserMedia calls.
+ *
+ * Flow:
+ *  1. Pause recogniser (releases browser's exclusive mic lock)
+ *  2. getUserMedia → stream
+ *  3. Start MediaRecorder on stream
+ *  4. Start a NEW SpeechRecognition instance pointed at the same stream
+ *     (via AudioContext source trick not needed — browser shares hw mic fine
+ *      once the old instance is fully stopped)
+ *  5. On "i agree" → stop recorder → resume main recogniser
+ *  6. Timeout fallback at timeoutMs
+ */
+const recordUntilIAgree = (timeoutMs = 15000) => new Promise(async (resolve, reject) => {
+  // Pause the always-on recogniser so the browser releases mic exclusivity
+  window._darwinPause?.();
+  // Small gap to let the browser fully release the mic before we re-open it
+  await new Promise(r => setTimeout(r, 250));
+
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (err) {
+    window._darwinResume?.();
     reject(new Error('Microphone access denied: ' + err.message));
     return;
   }
+
   const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg']
     .find(m => MediaRecorder.isTypeSupported(m)) || '';
   const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
@@ -137,29 +177,93 @@ const recordShortClip = () => new Promise(async (resolve, reject) => {
   recorder.ondataavailable = (e) => { if (e.data?.size > 0) chunks.push(e.data); };
   recorder.onerror = (e) => {
     stream.getTracks().forEach(t => t.stop());
+    window._darwinResume?.();
     reject(new Error('MediaRecorder error: ' + e.error?.message));
   };
+
   recorder.start();
-  console.log('[recordShortClip] Started, mimeType:', mimeType || 'browser default');
-  await new Promise(r => setTimeout(r, 2500));
-  recorder.stop();
+  console.log('[recordUntilIAgree] Recording started, mimeType:', mimeType || 'browser default');
+
+  // Spin up a dedicated short-lived recogniser for "i agree" detection
+  // (the main recogniser is paused; this one runs only during recording)
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let localRec = null;
+  if (SR) {
+    localRec = new SR();
+    localRec.lang           = 'en-US';
+    localRec.continuous     = true;
+    localRec.interimResults = false;
+    localRec.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .slice(event.resultIndex)
+        .filter(r => r.isFinal)
+        .map(r => r[0].transcript.trim().toLowerCase())
+        .join(' ');
+      if (!transcript) return;
+      console.log('[recordUntilIAgree] localRec heard:', transcript);
+      // Dispatch so the existing onVoiceCommand listener below picks it up
+      window.dispatchEvent(new CustomEvent('voiceCommand', { detail: transcript }));
+    };
+    localRec.onerror = (e) => console.warn('[recordUntilIAgree] localRec error:', e.error);
+    try { localRec.start(); } catch (e) { console.warn('[recordUntilIAgree] localRec start failed:', e); }
+  }
+
+  let detected = false;
+  let stopped = false;
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearTimeout(hardTimeout);
+    window.removeEventListener('voiceCommand', onVoiceCommand);
+    if (localRec) { try { localRec.abort(); } catch (_) {} localRec = null; }
+    if (recorder.state === 'recording') recorder.stop();
+  };
+
+  const onVoiceCommand = (e) => {
+    const cmd = typeof e.detail === 'string' ? e.detail : '';
+    if (cmd.includes('i agree')) {
+      console.log('[recordUntilIAgree] "i agree" detected — stopping');
+      detected = true;
+      stop();
+    }
+  };
+
+  window.addEventListener('voiceCommand', onVoiceCommand);
+  const hardTimeout = setTimeout(() => {
+    console.log('[recordUntilIAgree] Timeout — no "i agree" detected');
+    stop();
+  }, timeoutMs);
+
   await new Promise(r => { recorder.onstop = r; });
   stream.getTracks().forEach(t => t.stop());
+  // Resume the always-on recogniser now that we're done with the mic
+  window._darwinResume?.();
   const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
-  console.log('[recordShortClip] Done. Blob:', blob.size, 'bytes');
-  resolve(blob);
+  console.log('[recordUntilIAgree] Done. detected:', detected, 'blob:', blob.size, 'bytes');
+  resolve({ blob, detected });
 });
 
 export default function App() {
   const [userId, setUserId] = useState('');
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+
+  // Auto-login if userId is present in sessionStorage
+  useEffect(() => {
+    const storedUserId = sessionStorage.getItem('userId');
+    if (storedUserId && !isLoggedIn) {
+      setUserId(storedUserId);
+      setIsLoggedIn(true);
+    }
+  }, [isLoggedIn]);
   const [activeTab, setActiveTab] = useState('me');
   const [recordingState, setRecordingState] = useState('idle');
   const [privateMessages, setPrivateMessages] = useState([]);
   const [sharedMessages, setSharedMessages] = useState([]);
   const [pendingInvitations, setPendingInvitations] = useState([]);
   const [partnerId, setPartnerId] = useState(null);
-  const [isUnlocked, setIsUnlocked] = useState(false);
+  const [isPrivateUnlocked, setIsPrivateUnlocked] = useState(false);
+  const [isSharedUnlocked, setIsSharedUnlocked] = useState(false);
   const [lockCountdown, setLockCountdown] = useState(0);
   const [isHearing, setIsHearing] = useState(false);
   const [verifying, setVerifying] = useState(false);
@@ -185,7 +289,7 @@ export default function App() {
   useEffect(() => { unlockActionPendingRef.current = unlockActionPending; }, [unlockActionPending]);
 
   useEffect(() => {
-    const forceLockHandler = () => { setIsUnlocked(false); setLockCountdown(0); };
+    const forceLockHandler = () => { setIsPrivateUnlocked(false); setIsSharedUnlocked(false); setLockCountdown(0); };
     window.addEventListener('forceLock', forceLockHandler);
     return () => window.removeEventListener('forceLock', forceLockHandler);
   }, []);
@@ -194,7 +298,7 @@ export default function App() {
   const onSpeechEnd = useCallback(() => setIsHearing(false), []);
 
   useVoiceRecognition({
-    enabled: isLoggedIn && !verifying && !isUnlocked,
+    enabled: isLoggedIn && !verifying,
     onSpeechStart,
     onSpeechEnd,
   });
@@ -206,9 +310,10 @@ export default function App() {
     });
   }, [userId]);
 
-  const markUnlocked = useCallback(() => {
+  const markUnlocked = useCallback((scope = 'private') => {
     setRecordingState('matched');
-    setIsUnlocked(true);
+    if (scope === 'shared') setIsSharedUnlocked(true);
+    else setIsPrivateUnlocked(true);
     setLockCountdown(60);
     setUnlockStatus(null);
     setVerifyError('');
@@ -295,18 +400,125 @@ export default function App() {
       return;
     }
     setVerifyError('');
+    setUnlockStatus(null);
     setActiveTab('me');
-    const request = buildPrivateUnlockRequest({ userId });
-    setActiveUnlockRequest(request);
+    setUnlockActionPending(true);
+
+    // Insert a real DB row so the attempt is logged and the overlay has a proper id
+    const now = new Date().toISOString();
+    let request;
     try {
-      pendingRecordRef.current = { sender: userId, recipient: userId, type: 'private' };
-      await startRecording();
-      setRecordingState('recording');
+      const { data: inserted, error: insertErr } = await supabase
+        .from('unlock_requests')
+        .insert({
+          requester_id: userId,
+          partner_id: userId, // self-unlock
+          type: 'private',
+          status: 'countdown',
+          countdown_started_at: now,
+          created_at: now,
+        })
+        .select()
+        .single();
+      if (insertErr) throw insertErr;
+      request = {
+        id: inserted.id,
+        kind: 'private',
+        requesterId: userId,
+        partnerId: userId,
+        status: 'countdown',
+        countdownStartedAt: now,
+        requesterAgreedAt: null,
+        partnerAgreedAt: null,
+        createdAt: now,
+        unlockedAt: null,
+      };
     } catch (err) {
-      console.error('[Unlock] Failed to start recording:', err);
-      setVerifyError('Microphone could not start.');
+      console.error('[Unlock:private] Failed to insert unlock_request row:', err);
+      // Fall back to a local-only request so the UI still works
+      request = buildPrivateUnlockRequest({ userId });
     }
-  }, [userId, startRecording]);
+
+    setActiveUnlockRequest(request);
+    await setUserActiveUnlock(userId, request.id);
+
+    try {
+      // Wait out the countdown visually, then auto-record
+      const countdownMs = UNLOCK_COUNTDOWN_SECONDS * 1000;
+      await new Promise(r => setTimeout(r, countdownMs));
+
+      console.log('[Unlock:private] Countdown done — starting recording');
+      setUnlockStatus(UNLOCK_STATUS.RECORDING);
+
+      let audioBlob, detected;
+      try {
+        ({ blob: audioBlob, detected } = await recordUntilIAgree());
+      } catch (micErr) {
+        setVerifyError(micErr.message || 'Microphone access denied.');
+        setUnlockStatus(UNLOCK_STATUS.ERROR);
+        return;
+      }
+      if (!detected) {
+        setVerifyError('No "I agree" detected. Please say it clearly and try again.');
+        setUnlockStatus(UNLOCK_STATUS.ERROR);
+        await supabase.from('unlock_requests').update({ status: 'verification_failed' }).eq('id', request.id);
+        return;
+      }
+      if (!audioBlob || audioBlob.size === 0) {
+        setVerifyError('No audio captured. Please try again.');
+        setUnlockStatus(UNLOCK_STATUS.ERROR);
+        return;
+      }
+
+      setUnlockStatus(UNLOCK_STATUS.VERIFYING);
+      const formData = new FormData();
+      formData.append('audio', audioBlob, 'audio.webm');
+      formData.append('user_id', userId);
+
+      let resp, data;
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);
+        resp = await fetch(`${BACKEND_URL}/verify-me`, { method: 'POST', body: formData, signal: controller.signal });
+        clearTimeout(timeout);
+        data = await resp.json();
+      } catch (fetchErr) {
+        const msg = fetchErr?.name === 'AbortError'
+          ? 'Server took too long to respond. Try again.'
+          : 'Could not reach the server. Check your connection.';
+        setVerifyError(msg);
+        setUnlockStatus(UNLOCK_STATUS.ERROR);
+        return;
+      }
+
+      console.log('[Unlock:private] /verify-me response:', data);
+      if (data.error || !data.success) {
+        setVerifyError(data.error || 'Voice verification failed.');
+        setUnlockStatus(UNLOCK_STATUS.ERROR);
+        // Log the failure in DB
+        await supabase.from('unlock_requests')
+          .update({ status: 'verification_failed' })
+          .eq('id', request.id);
+        return;
+      }
+
+      // Success — mark unlocked in DB then locally
+      const unlockedAt = new Date().toISOString();
+      await supabase.from('unlock_requests')
+        .update({ status: 'unlocked', unlocked_at: unlockedAt })
+        .eq('id', request.id);
+      await setUserActiveUnlock(userId, null);
+
+      setUnlockStatus(null);
+      setActiveUnlockRequest((current) => {
+        if (!current || current.id !== request.id) return current;
+        return { ...current, status: 'unlocked', unlockedAt };
+      });
+      markUnlocked('private');
+    } finally {
+      setUnlockActionPending(false);
+    }
+  }, [userId]);
 
   const startSharedUnlockFlow = useCallback(async () => {
     if (unlockActionPendingRef.current) return;
@@ -323,10 +535,16 @@ export default function App() {
       const { data, error } = await supabase.from('unlock_requests').insert({
         requester_id: userId,
         partner_id: currentPartnerId,
+        type: 'shared',
         status: 'pending_partner',
         created_at: new Date().toISOString(),
       }).select().single();
       if (error) throw error;
+      // Mark both users as having an active unlock request so login restore works correctly
+      await Promise.all([
+        setUserActiveUnlock(userId, data.id),
+        setUserActiveUnlock(currentPartnerId, data.id),
+      ]);
       setActiveUnlockRequest(mapUnlockRequest(data));
     } catch (err) {
       console.error('[App] Could not create unlock request:', err);
@@ -373,13 +591,18 @@ export default function App() {
       await supabase.from('unlock_requests')
         .update({ status: 'declined' })
         .eq('id', request.id);
-      // Show declined state briefly on this side, then dismiss
+      // Clear the active pointer on both users so login restore won't resurface this
+      await Promise.all([
+        setUserActiveUnlock(request.requesterId, null),
+        setUserActiveUnlock(request.partnerId, null),
+      ]);
+      // Show declined state — user must close manually
       setActiveUnlockRequest((cur) => cur?.id === request.id ? { ...cur, status: 'declined' } : cur);
       setUnlockStatus(UNLOCK_STATUS.DECLINED);
-      window.setTimeout(dismissUnlockOverlay, 2000);
     } catch (err) {
       console.error('[Unlock] Decline failed:', err);
-      dismissUnlockOverlay();
+      // Still show declined state rather than silently closing
+      setUnlockStatus(UNLOCK_STATUS.DECLINED);
     } finally {
       setUnlockActionPending(false);
     }
@@ -396,65 +619,44 @@ export default function App() {
       : 0;
     if (countdownRemaining > 0) return;
 
-    const now = new Date().toISOString();
     setVerifyError('');
     setUnlockStatus(null);
     setUnlockActionPending(true);
 
     try {
-      if (request.kind === 'private') {
-        console.log('[Unlock:private] Capturing "I agree" recording...');
-        setUnlockStatus(UNLOCK_STATUS.RECORDING);
-        const result = await stopAndUpload('private', { upload: false, transcribe: false });
-        if (!result?.blob) {
-          setVerifyError('Recording failed — no audio captured. Please try again.');
-          setUnlockStatus(UNLOCK_STATUS.ERROR);
-          setUnlockActionPending(false);
-          return;
-        }
-        setUnlockStatus(UNLOCK_STATUS.VERIFYING);
-        const formData = new FormData();
-        formData.append('audio', result.blob, 'audio.webm');
-        formData.append('user_id', userId);
-        let resp, data;
-        try {
-          resp = await fetch(`${BACKEND_URL}/verify-me`, { method: 'POST', body: formData });
-          data = await resp.json();
-        } catch (fetchErr) {
-          setVerifyError('Could not reach the server. Check your connection.');
-          setUnlockStatus(UNLOCK_STATUS.ERROR);
-          setUnlockActionPending(false);
-          return;
-        }
-        console.log('[Unlock:private] /verify-me response:', data);
-        if (data.error || !data.success) {
-          setVerifyError(data.error || 'Voice verification failed.');
-          setUnlockStatus(UNLOCK_STATUS.ERROR);
-          setUnlockActionPending(false);
-          return;
-        }
-        setUnlockStatus(null);
-        setActiveUnlockRequest((current) => {
-          if (!current || current.id !== request.id) return current;
-          return { ...current, requesterAgreedAt: now, status: 'unlocked', unlockedAt: now };
-        });
-        setUnlockActionPending(false);
-        return;
-      }
+      // Private unlock is fully handled in startPrivateUnlockFlow
+      if (request.kind === 'private') { setUnlockActionPending(false); return; }
 
       const isRequester = request.requesterId === userId;
-      const alreadyAgreed = isRequester ? request.requesterAgreedAt : request.partnerAgreedAt;
-      if (alreadyAgreed) { setUnlockActionPending(false); return; }
+      const alreadyRecorded = isRequester ? request.requesterAudioUrl : request.partnerAudioUrl;
+      if (alreadyRecorded) { setUnlockActionPending(false); return; }
 
-      console.log('[Unlock:shared] Recording "I agree"...');
+      // Stamp recording_started_at BEFORE mic opens so server can compare simultaneity
+      const recordingStartedAt = new Date().toISOString();
+      const role = isRequester ? 'requester' : 'partner';
+      await supabase.from('unlock_requests').update(
+        isRequester
+          ? { requester_recording_started_at: recordingStartedAt, status: 'recording' }
+          : { partner_recording_started_at: recordingStartedAt, status: 'recording' }
+      ).eq('id', request.id);
+
+      console.log(`[Unlock:shared] Recording started at ${recordingStartedAt}`);
       setUnlockStatus(UNLOCK_STATUS.RECORDING);
-      let audioBlob;
+
+      let audioBlob, detected;
       try {
-        audioBlob = await recordShortClip();
+        ({ blob: audioBlob, detected } = await recordUntilIAgree());
       } catch (micErr) {
         setVerifyError(micErr.message || 'Microphone access denied.');
         setUnlockStatus(UNLOCK_STATUS.ERROR);
         setUnlockActionPending(false);
+        return;
+      }
+      if (!detected) {
+        setVerifyError('No "I agree" detected. Please say it clearly and try again.');
+        setUnlockStatus(UNLOCK_STATUS.ERROR);
+        setUnlockActionPending(false);
+        await supabase.from('unlock_requests').update({ status: 'verification_failed' }).eq('id', request.id);
         return;
       }
       if (!audioBlob || audioBlob.size === 0) {
@@ -464,7 +666,6 @@ export default function App() {
         return;
       }
 
-      const role = isRequester ? 'requester' : 'partner';
       const ext = audioBlob.type.includes('ogg') ? 'ogg' : 'webm';
       const storagePath = `${request.id}_${role}.${ext}`;
       console.log(`[Unlock:shared] Uploading to i-agree/${storagePath}...`);
@@ -476,12 +677,13 @@ export default function App() {
       if (upErr) throw new Error(`Upload failed: ${upErr.message}`);
 
       const audioUrl = supabase.storage.from('i-agree').getPublicUrl(storagePath).data.publicUrl;
-      const payload = isRequester
+      const now = new Date().toISOString();
+      const audioPayload = isRequester
         ? { requester_audio_url: audioUrl, requester_agreed_at: now }
         : { partner_audio_url: audioUrl, partner_agreed_at: now };
 
       const { data: updated, error: updateErr } = await supabase
-        .from('unlock_requests').update(payload).eq('id', request.id).select().single();
+        .from('unlock_requests').update(audioPayload).eq('id', request.id).select().single();
       if (updateErr) throw updateErr;
       setActiveUnlockRequest(mapUnlockRequest(updated));
 
@@ -503,9 +705,16 @@ export default function App() {
           return;
         }
         if (!data.success) {
-          setVerifyError(data.error || 'Shared voice verification failed.');
+          const msg = data.error || 'Shared voice verification failed.';
+          setVerifyError(msg);
           setUnlockStatus(UNLOCK_STATUS.ERROR);
         } else {
+          // Immediately flip local status so completedUnlockId fires without waiting for realtime
+          const unlockedAt = new Date().toISOString();
+          setActiveUnlockRequest((cur) => {
+            if (!cur || cur.id !== request.id) return cur;
+            return { ...cur, status: 'unlocked', unlockedAt };
+          });
           setUnlockStatus(null);
         }
       } else {
@@ -517,7 +726,7 @@ export default function App() {
     } finally {
       setUnlockActionPending(false);
     }
-  }, [userId, stopAndUpload]);
+  }, [userId]);
 
   // ── Data load + realtime subscriptions ──────────────────────────────────
   useEffect(() => {
@@ -527,11 +736,18 @@ export default function App() {
       if (row?.requester_id !== userId && row?.partner_id !== userId) return;
       const mapped = mapUnlockRequest(row);
 
-      // Someone declined — show the declined state, then auto-dismiss after 2s
+      // Terminal: declined — show declined state, user must close manually
       if (mapped.status === 'declined') {
         setActiveUnlockRequest((cur) => cur?.id === mapped.id ? { ...cur, status: 'declined' } : cur);
         setUnlockStatus(UNLOCK_STATUS.DECLINED);
-        window.setTimeout(dismissUnlockOverlay, 2500);
+        return;
+      }
+
+      // Terminal: verification_failed — show error in overlay, don't auto-close
+      if (mapped.status === 'verification_failed') {
+        setActiveUnlockRequest((cur) => cur?.id === mapped.id ? { ...cur, status: 'verification_failed' } : cur);
+        setUnlockStatus(UNLOCK_STATUS.ERROR);
+        setVerifyError('Voice verification failed. Please try again.');
         return;
       }
 
@@ -544,25 +760,39 @@ export default function App() {
     };
 
     (async () => {
-      const [{ data: priv }, { data: shared }, { data: invites }, unlockResult] = await Promise.all([
+      const [{ data: priv }, { data: shared }, { data: invites }, { data: userData }] = await Promise.all([
         supabase.from('messages').select('*').eq('sender', userId).eq('type', 'private').order('timestamp', { ascending: false }),
         supabase.from('messages').select('*').contains('participants', [userId]).order('timestamp', { ascending: false }),
         supabase.from('invitations').select('*').eq('to', userId).eq('status', 'pending'),
-        supabase.from('unlock_requests').select('*')
-          .or(`requester_id.eq.${userId},partner_id.eq.${userId}`)
-          .order('created_at', { ascending: false })
-          .limit(10),
+        supabase.from('users').select('active_unlock_request_id').eq('id', userId).single(),
       ]);
 
       setPrivateMessages((priv ?? []).map(mapMessage));
       setSharedMessages((shared ?? []).map(mapMessage));
       setPendingInvitations((invites ?? []).map(mapInvitation));
 
-      if (unlockResult.error) {
-        console.error('[App] Could not load unlock requests:', unlockResult.error);
-      } else {
-        const latestUnlock = (unlockResult.data ?? []).map(mapUnlockRequest).find(isUnlockRequestActive);
-        if (latestUnlock) { setActiveTab('us'); setActiveUnlockRequest(latestUnlock); }
+      // Only restore an unlock overlay if the users row has an explicit active request ID.
+      // This is set when a request is created/accepted and cleared on resolve/decline —
+      // so stale rows from past sessions will never re-surface here.
+      const activeId = userData?.active_unlock_request_id;
+      if (activeId) {
+        const { data: unlockRow, error: unlockErr } = await supabase
+          .from('unlock_requests').select('*').eq('id', activeId).single();
+        if (!unlockErr && unlockRow) {
+          const mapped = mapUnlockRequest(unlockRow);
+          if (isUnlockRequestActive(mapped)) {
+            console.log('[App] Restoring active unlock request from users row:', activeId);
+            setActiveTab('us');
+            setActiveUnlockRequest(mapped);
+          } else {
+            // Row exists but is no longer active (e.g. timed out) — clean up the pointer
+            console.log('[App] Stale active_unlock_request_id found, clearing it.');
+            await setUserActiveUnlock(userId, null);
+          }
+        } else {
+          // Row was deleted — clean up the pointer
+          await setUserActiveUnlock(userId, null);
+        }
       }
     })();
 
@@ -618,13 +848,15 @@ export default function App() {
     };
   }, [userId, dismissUnlockOverlay]);
 
+  const isUnlocked = isPrivateUnlocked || isSharedUnlocked;
+
   useEffect(() => {
     if (!isUnlocked) return;
     const tick = setInterval(() => {
       const elapsed = Date.now() - lastActivityRef.current;
       const remaining = Math.max(0, Math.ceil((60000 - elapsed) / 1000));
       setLockCountdown(remaining);
-      if (elapsed > 60000) { setIsUnlocked(false); setLockCountdown(0); }
+      if (elapsed > 60000) { setIsPrivateUnlocked(false); setIsSharedUnlocked(false); setLockCountdown(0); }
     }, 1000);
     return () => clearInterval(tick);
   }, [isUnlocked]);
@@ -642,6 +874,10 @@ export default function App() {
     };
   }, [isUnlocked]);
 
+  // Tracks whether we've already auto-fired recording for a given request,
+  // so the 250ms tick doesn't trigger it multiple times.
+  const autoRecordFiredRef = useRef(null);
+
   useEffect(() => {
     if (!activeUnlockRequest) return;
     setUnlockNow(Date.now());
@@ -649,17 +885,38 @@ export default function App() {
     return () => clearInterval(timer);
   }, [activeUnlockRequest?.id, activeUnlockRequest?.status, activeUnlockRequest?.countdownStartedAt]);
 
+  // Auto-trigger recording when shared countdown hits 0
+  useEffect(() => {
+    if (!activeUnlockRequest) return;
+    if (activeUnlockRequest.kind !== 'shared') return;
+    if (activeUnlockRequest.status !== 'countdown') return;
+    if (unlockActionPendingRef.current) return;
+    const remaining = getCountdownRemaining(activeUnlockRequest.countdownStartedAt, unlockNow);
+    if (remaining > 0) return;
+    if (autoRecordFiredRef.current === activeUnlockRequest.id) return; // already fired
+    autoRecordFiredRef.current = activeUnlockRequest.id;
+    console.log('[Unlock:shared] Countdown hit 0 — auto-starting recording');
+    recordUnlockAgreement();
+  }, [unlockNow, activeUnlockRequest, recordUnlockAgreement]);
+
   const completedUnlockId = activeUnlockRequest && isUnlockRequestComplete(activeUnlockRequest)
     ? activeUnlockRequest.id : null;
 
   useEffect(() => {
     if (!completedUnlockId) return;
-    markUnlocked();
-    const timer = window.setTimeout(() => {
-      setActiveUnlockRequest((current) => current?.id === completedUnlockId ? null : current);
-    }, 1600);
-    return () => window.clearTimeout(timer);
-  }, [completedUnlockId, markUnlocked]);
+    const req = activeUnlockRequest;
+    markUnlocked(req?.kind === 'shared' ? 'shared' : 'private');
+    // Clear the pointer on both users — request is resolved
+    if (req?.kind === 'shared') {
+      Promise.all([
+        setUserActiveUnlock(req.requesterId, null),
+        setUserActiveUnlock(req.partnerId, null),
+      ]);
+    } else if (req?.kind === 'private') {
+      setUserActiveUnlock(userId, null);
+    }
+    // Overlay stays open — user closes it manually via the Close button
+  }, [completedUnlockId, markUnlocked, userId]);
 
   const sendInvitation = useCallback(async (toId) => {
     const { error } = await supabase.from('invitations').insert({
@@ -710,15 +967,20 @@ export default function App() {
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
+    sessionStorage.removeItem('userId');
     setUserId(''); setIsLoggedIn(false); setPartnerId(null);
     setPrivateMessages([]); setSharedMessages([]); setPendingInvitations([]);
-    setIsUnlocked(false); setLockCountdown(0); setRecordingState('idle');
+    setIsPrivateUnlocked(false); setIsSharedUnlocked(false); setLockCountdown(0); setRecordingState('idle');
     setVerifyError(''); setActiveUnlockRequest(null); setUnlockActionPending(false);
     setUnlockStatus(null);
   };
 
   if (!isLoggedIn) {
-    return <LoginScreen onLogin={(id) => { setUserId(id); setIsLoggedIn(true); }} />;
+    return <LoginScreen onLogin={(id) => {
+      sessionStorage.setItem('userId', id);
+      setUserId(id);
+      setIsLoggedIn(true);
+    }} />;
   }
 
   const meMessages = privateMessages;
@@ -751,7 +1013,7 @@ export default function App() {
                   <p className="text-[12px] text-[#3a4155] max-w-[200px] leading-relaxed">{emptyHint}</p>
                 </div>
               ) : (
-                meMessages.map((msg) => <VoiceMessageCard key={msg.id} message={msg} isUnlocked={isUnlocked} />)
+                meMessages.map((msg) => <VoiceMessageCard key={msg.id} message={msg} isUnlocked={isPrivateUnlocked} />)
               )}
             </div>
           )}
@@ -768,7 +1030,7 @@ export default function App() {
                     </div>
                   </div>
                 ) : (
-                  usMessages.map((msg) => <VoiceMessageCard key={msg.id} message={msg} isUnlocked={isUnlocked} />)
+                  usMessages.map((msg) => <VoiceMessageCard key={msg.id} message={msg} isUnlocked={isSharedUnlocked} />)
                 )}
               </div>
             ) : pendingInvitations.length === 0 ? (
@@ -822,6 +1084,7 @@ export default function App() {
           onAcceptSharedRequest={acceptSharedUnlockRequest}
           onVerifyMe={recordUnlockAgreement}
           onDecline={declineUnlockRequest}
+          onDismiss={dismissUnlockOverlay}
           onDismissError={() => { setVerifyError(''); setUnlockStatus(null); }}
         />
       )}

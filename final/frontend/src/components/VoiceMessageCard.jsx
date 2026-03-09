@@ -35,32 +35,28 @@ export default function VoiceMessageCard({ message, isUnlocked }) {
     : '--:--';
 
   useEffect(() => {
-    if (!audioRef.current) return;
+    const audio = audioRef.current;
+    if (!audio) return;
     if (isPlaying) {
-      // Pause all other audios
       window.dispatchEvent(new CustomEvent('pauseAllAudio'));
-      audioRef.current.play();
+      audio.play();
     } else {
-      audioRef.current.pause();
+      audio.pause();
     }
   }, [isPlaying]);
 
-  // Stop playing and reset icon when audio ends
+  // Capture the node at effect-run time so cleanup never sees a null ref
   useEffect(() => {
-    if (!audioRef.current) return;
-    const handleEnded = () => {
-      setIsPlaying(false);
-    };
-    audioRef.current.addEventListener('ended', handleEnded);
-    return () => audioRef.current.removeEventListener('ended', handleEnded);
+    const audio = audioRef.current;
+    if (!audio) return;
+    const handleEnded = () => setIsPlaying(false);
+    audio.addEventListener('ended', handleEnded);
+    return () => audio.removeEventListener('ended', handleEnded);
   }, []);
 
-  // Listen for global pause event
   useEffect(() => {
     const pauseListener = () => {
-      if (isPlaying) {
-        setIsPlaying(false);
-      }
+      if (isPlaying) setIsPlaying(false);
     };
     window.addEventListener('pauseAllAudio', pauseListener);
     return () => window.removeEventListener('pauseAllAudio', pauseListener);
@@ -74,21 +70,18 @@ export default function VoiceMessageCard({ message, isUnlocked }) {
     }>
       <div className="flex items-center justify-between px-3 pt-3 pb-1">
         <div className="flex items-center gap-2">
-            {
-                isUnlocked &&
-                <button
-            onClick={() => setIsPlaying(!isPlaying)}
-            className={`cursor-pointer flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-semibold transition-all
-              ${isPlaying
-                ? 'bg-[#7c3aed] text-white shadow-[0_0_10px_rgba(124,58,237,0.4)]'
-                : 'bg-[#7c3aed]/10 text-[#7c3aed] border border-[#7c3aed]/30 hover:bg-[#7c3aed]/20'
-              }`
-            }
-          >
-            {isPlaying ? <PauseIcon /> : <PlayIcon />}
-            {/* {isPlaying ? 'Pause' : 'Play'} */}
-          </button>
-            }
+          {isUnlocked && (
+            <button
+              onClick={() => setIsPlaying(!isPlaying)}
+              className={`cursor-pointer flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-semibold transition-all
+                ${isPlaying
+                  ? 'bg-[#7c3aed] text-white shadow-[0_0_10px_rgba(124,58,237,0.4)]'
+                  : 'bg-[#7c3aed]/10 text-[#7c3aed] border border-[#7c3aed]/30 hover:bg-[#7c3aed]/20'
+                }`}
+            >
+              {isPlaying ? <PauseIcon /> : <PlayIcon />}
+            </button>
+          )}
           {isUnlocked
             ? <span className="text-[10px] font-semibold text-[#7c3aed] uppercase tracking-widest">Unlocked</span>
             : <span className="text-[10px] font-semibold text-[#4b5368] uppercase tracking-widest flex items-center gap-1"><LockIcon />Locked</span>

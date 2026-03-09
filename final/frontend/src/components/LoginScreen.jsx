@@ -103,11 +103,14 @@ export default function LoginScreen({ onLogin }) {
         setUnlockVerified(true);
         setError('');
       } else {
-        setError(
-          typeof data?.error === 'string'
-            ? data.error
-            : 'Voice verification failed. Please try again.'
-        );
+        // Only set error if not already set (prevents flicker)
+        if (!error) {
+          setError(
+            typeof data?.error === 'string'
+              ? data.error
+              : 'Voice verification failed. Please try again.'
+          );
+        }
         // Clear so re-record button re-enables
         setBiometricBlob(null);
         setBiometricRecorded(false);
@@ -147,6 +150,7 @@ export default function LoginScreen({ onLogin }) {
 
       if (existing?.id) {
         // User exists — treat as login
+        sessionStorage.setItem('userId', userIdClean);
         setSuccess('Welcome back! Redirecting...');
         setTimeout(() => {
           window.lastVoiceBlob = biometricBlob;
@@ -168,6 +172,7 @@ export default function LoginScreen({ onLogin }) {
         return;
       }
 
+      sessionStorage.setItem('userId', userIdClean);
       setSuccess('Account created successfully! Redirecting...');
       setTimeout(() => {
         window.lastVoiceBlob = biometricBlob;

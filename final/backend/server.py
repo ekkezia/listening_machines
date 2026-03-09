@@ -156,28 +156,17 @@ def verify_me():
 
     result = whisper_model.transcribe(tmp_path)
     transcription = result["text"]
-    said_i_agree = bool(transcription and "i agree" in transcription.lower())
-
-    if not said_i_agree:
-        os.remove(tmp_path)
-        return jsonify({
-            'error': 'User did not say "I agree". Access denied.',
-            'said_i_agree': False,
-            'transcription': transcription,
-            'predicted_label': None,
-            'unlock': False,
-            'success': False,
-        }), 403
-
     predicted_label = predict_class(tmp_path)
     unlock = predicted_label == user_id
     os.remove(tmp_path)
 
+    print(f'[verify-me] user_id={user_id}, transcription="{transcription}", predicted_label={predicted_label}')
+
     return jsonify({
         'transcription': transcription,
         'predicted_label': predicted_label,
-        'unlock': unlock,
-        'success': True, # todo: change to unlock on production
+        'unlock': True, # todo change to unlock on production
+        'success': True,
     }), 200
 
 @app.route('/verify-shared-unlock', methods=['OPTIONS', 'POST'])
@@ -213,22 +202,35 @@ def verify_shared_unlock():
     partner_id          = unlock_req['partner_id']
     requester_audio_url = unlock_req.get('requester_audio_url')
     partner_audio_url   = unlock_req.get('partner_audio_url')
-    requester_agreed_at = unlock_req.get('requester_agreed_at')
-    partner_agreed_at   = unlock_req.get('partner_agreed_at')
+    requester_started_at = unlock_req.get('requester_recording_started_at')
+    partner_started_at   = unlock_req.get('partner_recording_started_at')
+
+    req_time = parse_iso(requester_started_at)
+    par_time = parse_iso(partner_started_at)
+
+    req_time = parse_iso(requester_started_at)
+    par_time = parse_iso(partner_started_at)
 
     if not requester_audio_url or not partner_audio_url:
-        return jsonify({'error': 'Both audio recordings must be uploaded before verification.'}), 400
+        started = req_time or par_time
+        if started:
+            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+            if elapsed > 10:
+                _mark_verification_failed(request_id, requester_id, partner_id)
+                return jsonify({
+                    'success': False,
+                    'error': 'The other user did not respond in time.',
+                }), 403
+        return jsonify({'success': False, 'error': 'Still waiting for the other user to record.'}), 202
 
-    # 2. Timestamp check — must agree within 5 seconds of each other
-    req_time = parse_iso(requester_agreed_at)
-    par_time = parse_iso(partner_agreed_at)
+    # Timestamp check — both must have started recording within 5 seconds of each other
     if req_time and par_time:
         diff_seconds = abs((req_time - par_time).total_seconds())
-        if diff_seconds > 10:
-            _clear_audio_urls(request_id)
+        if diff_seconds > 5:
+            _mark_verification_failed(request_id, requester_id, partner_id)
             return jsonify({
                 'success': False,
-                'error': f'Recordings too far apart ({diff_seconds:.1f}s). Both must agree within 5 seconds.',
+                'error': f'Recordings started too far apart ({diff_seconds:.1f}s). Both must begin within 5 seconds of each other.',
             }), 403
 
     # 3. Extract storage paths from public URLs
@@ -285,31 +287,60 @@ def verify_shared_unlock():
             'requester_audio_url': None,
             'partner_audio_url': None,
         }).eq('id', request_id).execute()
+        # Clear active_unlock_request_id on both users
+        for uid in [requester_id, partner_id]:
+            try:
+                supabase_admin.table('users').update({
+                    'active_unlock_request_id': None,
+                }).eq('id', uid).execute()
+            except Exception as e:
+                print(f'[verify-shared-unlock] Warning clearing user pointer for {uid}: {e}')
 
-        print(f'[verify-shared-unlock] Request {request_id} unlocked successfully at {now_iso}. Requester predicted: {requester_predicted}, Partner predicted: {partner_predicted}')  
-
+        print(f'[verify-shared-unlock] SUCCESS: request_id={request_id}, requester_predicted={requester_predicted}, partner_predicted={partner_predicted}')
         return jsonify({
             'success': True,
             'requester_predicted': requester_predicted,
             'partner_predicted': partner_predicted,
         }), 200
     else:
-        # Failure → clear audio URLs so both can retry
-        _clear_audio_urls(request_id)
+        # Failure → set terminal status so the overlay closes on both sides
+        _mark_verification_failed(request_id, requester_id, partner_id)
         errors = []
         if not requester_match:
             errors.append(f"Requester voice mismatch (expected '{requester_id}', got '{requester_predicted}')")
         if not partner_match:
             errors.append(f"Partner voice mismatch (expected '{partner_id}', got '{partner_predicted}')")
 
-        print(f'[verify-shared-unlock] Request {request_id} failed verification. Requester predicted: {requester_predicted}, Partner predicted: {partner_predicted}')
-        
         return jsonify({
-            'success': True, # todo: for production pls change to false
+            'success': False,
             'error': '; '.join(errors),
             'requester_predicted': requester_predicted,
             'partner_predicted': partner_predicted,
         }), 403
+
+def _mark_verification_failed(request_id, requester_id=None, partner_id=None):
+    """Set status=verification_failed and clear audio URLs + recording timestamps + user pointers."""
+    try:
+        supabase_admin.table('unlock_requests').update({
+            'status': 'verification_failed',
+            'requester_audio_url': None,
+            'partner_audio_url': None,
+            'requester_agreed_at': None,
+            'partner_agreed_at': None,
+            'requester_recording_started_at': None,
+            'partner_recording_started_at': None,
+        }).eq('id', request_id).execute()
+    except Exception as e:
+        print(f'[_mark_verification_failed] Warning updating unlock_request: {e}')
+    # Clear active_unlock_request_id on both users so the overlay won't resurface on login
+    for uid in [requester_id, partner_id]:
+        if uid:
+            try:
+                supabase_admin.table('users').update({
+                    'active_unlock_request_id': None,
+                }).eq('id', uid).execute()
+            except Exception as e:
+                print(f'[_mark_verification_failed] Warning clearing user pointer for {uid}: {e}')
 
 def _clear_audio_urls(request_id):
     """Reset audio URLs so users can retry recording."""

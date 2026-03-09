@@ -1,7 +1,8 @@
 const isUnlockRequestComplete = (request) => {
   if (!request) return false;
-  if (request.kind === 'private') return request.status === 'unlocked' || !!request.requesterAgreedAt;
-  return request.status === 'unlocked' || (!!request.requesterAgreedAt && !!request.partnerAgreedAt);
+  // Both private and shared: only trust status===unlocked, never agreedAt.
+  // agreedAt fields are intermediate markers written before server verification.
+  return request.status === 'unlocked';
 };
 
 function Spinner({ color = 'text-white', size = 'w-4 h-4' }) {
@@ -52,12 +53,6 @@ function ErrorPill({ message, onDismiss }) {
           <p className="text-[11px] text-[#f87171] mt-0.5 leading-relaxed">{message}</p>
         </div>
       </div>
-      <button
-        onClick={onDismiss}
-        className="mt-2.5 text-[11px] text-[#4b5368] hover:text-[#8892a4] transition-colors underline underline-offset-2"
-      >
-        Dismiss and retry
-      </button>
     </div>
   );
 }
@@ -126,6 +121,7 @@ export default function UnlockConsentOverlay({
   onAcceptSharedRequest,
   onVerifyMe,
   onDecline,
+  onDismiss,
   onDismissError,
 }) {
   if (!request) return null;
@@ -161,7 +157,14 @@ export default function UnlockConsentOverlay({
           <p className="text-[11px] uppercase tracking-[0.35em] text-[#94a3b8] font-semibold">Unlock Cancelled</p>
           <h2 className="mt-3 text-xl font-semibold tracking-tight text-[#f87171]">Request Declined</h2>
           <p className="mt-3 text-sm leading-6 text-[#94a3b8]">{message}</p>
-          <p className="mt-2 text-[11px] text-[#475569]">This overlay will close shortly…</p>
+          {onDismiss && (
+            <button
+              onClick={onDismiss}
+              className="mt-5 px-5 py-2 rounded-full border border-[#ef4444]/30 text-[12px] text-[#f87171] hover:text-[#f8fafc] hover:border-[#ef4444]/60 transition-colors"
+            >
+              Close
+            </button>
+          )}
         </div>
       </div>
     );
@@ -194,7 +197,7 @@ export default function UnlockConsentOverlay({
       );
     }
   } else if (countdownRemaining > 0) {
-    eyebrow = isShared ? 'Shared Consent' : 'Consent';
+    eyebrow = isShared ? 'Shared Consent' : 'Private Consent';
     title = 'Get ready to say "I agree"';
     body = isShared
       ? 'Both users will need to say "I agree" when the countdown ends.'
@@ -204,6 +207,11 @@ export default function UnlockConsentOverlay({
         {countdownRemaining}
       </div>
     );
+  } else if (unlockStatus === 'error') {
+    // error state — handled below via ErrorPill, just set eyebrow
+    eyebrow = isShared ? 'Shared Consent' : 'Private Consent';
+    title = 'Verification failed';
+    body = '';
   } else if (complete) {
     eyebrow = 'Unlocked';
     title = 'Consent received ✓';
@@ -214,36 +222,23 @@ export default function UnlockConsentOverlay({
     eyebrow = 'Shared Consent';
     title = 'Your voice was recorded';
     body = 'Waiting for your partner to also say "I agree".';
+  } else if (isShared && (request.status === 'recording' || isActivelyProcessing) && !currentUserAgreed) {
+    eyebrow = 'Shared Consent';
+    title = 'Say "I agree" now';
+    body = 'Recording is active — speak clearly into your microphone.';
+    showMicRing = true;
   } else if (isShared && partnerAgreed && !currentUserAgreed && !isActivelyProcessing) {
     eyebrow = 'Shared Consent';
     title = 'Your partner already agreed';
-    body = 'Say "I agree" now to finish unlocking the shared data.';
+    body = 'Recording will start automatically. Get ready to say "I agree".';
     showMicRing = true;
-    cta = (
-      <button
-        onClick={onVerifyMe}
-        disabled={isSubmitting}
-        className="mt-4 px-5 py-2.5 rounded-full bg-[#7c3aed] text-white text-sm font-semibold hover:bg-[#6d28d9] disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-[0_0_20px_rgba(124,58,237,0.3)]"
-      >
-        Tap to say "I agree"
-      </button>
-    );
   } else if (isShared && !currentUserAgreed && !isActivelyProcessing && unlockStatus !== 'error') {
     eyebrow = 'Shared Consent';
-    title = 'Say "I agree" now';
-    body = 'Both partners should say "I agree" to unlock the shared data.';
+    title = 'Get ready to say "I agree"';
+    body = 'Recording will start automatically when the countdown ends.';
     showMicRing = true;
-    cta = (
-      <button
-        onClick={onVerifyMe}
-        disabled={isSubmitting}
-        className="mt-4 px-5 py-2.5 rounded-full bg-[#7c3aed] text-white text-sm font-semibold hover:bg-[#6d28d9] disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-[0_0_20px_rgba(124,58,237,0.3)]"
-      >
-        Tap to say "I agree"
-      </button>
-    );
   } else if (!isShared && !isActivelyProcessing && unlockStatus !== 'error') {
-    eyebrow = 'Consent';
+    eyebrow = 'Private Consent';
     title = 'Say "I agree" now';
     body = 'Speak clearly. We are verifying that the voice saying "I agree" is yours.';
     showMicRing = true;
@@ -300,15 +295,25 @@ export default function UnlockConsentOverlay({
           <ErrorPill message={verifyError} onDismiss={onDismissError} />
         )}
 
-        {/* Hint */}
-        {!complete && (
+        {/* Hint — only while actively waiting / processing */}
+        {!complete && unlockStatus !== 'error' && (
           <p className="mt-5 text-[11px] leading-5 text-[#475569]">
             Keep this screen open and speak when prompted.
           </p>
         )}
 
-        {/* Decline button — always visible unless complete/declined */}
-        {!complete && onDecline && (
+        {/* Close button — shown after terminal states (error, complete) */}
+        {(complete || unlockStatus === 'error') && onDismiss && (
+          <button
+            onClick={onDismiss}
+            className="mt-5 px-5 py-2 rounded-full border border-[#2b3448] text-[12px] text-[#8892a4] hover:text-[#f8fafc] hover:border-[#4b5368] transition-colors"
+          >
+            Close
+          </button>
+        )}
+
+        {/* Decline button — always visible while request is still active */}
+        {!complete && unlockStatus !== 'error' && onDecline && (
           <DeclineButton
             onDecline={onDecline}
             isSubmitting={isSubmitting && !isActivelyProcessing}
